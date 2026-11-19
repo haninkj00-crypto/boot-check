@@ -9,7 +9,7 @@ Test your PC's compatibilities.
 
 **2.** Move the entire tree to DOS. Just make a floppy image or use any method you prefer.
 
-**3.** Run `build.bat` on DOS. It assumes MASM 6a, Turbo C++ 3 and Turbo Link 5 installed.
+**3.** Run `build.bat` on DOS. It assumes MASM 6.11, Turbo C++ 3 and Turbo Link 5 installed.
 
 **4.** Run `make-image.sh`, which makes a 64MB FAT32 partition. I recommend not to modify or delete the default `RESULT.TXT`.
 
