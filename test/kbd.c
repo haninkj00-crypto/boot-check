@@ -488,7 +488,7 @@ void run_kbd_test(void)
     detect_kbd_interface();
 
     /* 1. 기본 키 및 넘패드/펑션키 */
-    run_single_key("  [1.1] Type 'a' then Enter          : ", 2, 0,    0,    0);
+    run_single_key("  [1.1] Type 'a' then PRESS ENTER!   : ", 2, 0,    0,    0);
     run_single_key("  [1.2] Turn NumLock ON              : ", 1, 0x20, 0,    0);
     run_single_key("  [1.3] Press Numpad 0               : ", 3, '0',  0x52, 0);
     run_single_key("  [1.4] Press Main area 0            : ", 3, '0',  0x0B, 0);
