@@ -1,0 +1,25 @@
+
+ Start  Stop   Length Name               Class
+
+ 00000H 07DFFH 07E00H _TEXT              CODE
+
+
+Detailed map of segments
+
+ 0000:0000 7E00 C=CODE   S=_TEXT          G=(none)  M=BOOT.ASM   ACBP=28
+
+  Address         Publics by Name
+
+ 0000:7D52 idle  CLUS_TO_LBA
+ 0000:7D9E idle  NEXT_CLUS
+ 0000:7D73 idle  READ_SEC
+
+  Address         Publics by Value
+
+ 0000:7D52 idle  CLUS_TO_LBA
+ 0000:7D73 idle  READ_SEC
+ 0000:7D9E idle  NEXT_CLUS
+
+Program entry point at 0000:7C00
+Warning: No stack
+
