@@ -11,9 +11,9 @@ Test your PC's compatibilities.
 
 **3.** Run `build.bat` on DOS. It assumes MASM 6a, Turbo C++ 3 and Turbo Link 5 installed.
 
-**4.** Run `process-sector.py`, which process MBR.
+**4.** Run `make-image.sh`, which makes a 64MB FAT32 partition. I recommend not to modify or delete the default `RESULT.TXT`.
 
-**5.** Run `make-image.sh`, which makes a 64MB FAT32 partition and places the program properly. I recommend not to modify or delete the default `RESULT.TXT`.
+**5.** Run `process-sector.py`, which process MBR and places the program properly.
 
 **6.** Boot and test. The `RESULT.TXT` can store about 5 records. The oldest line will be deleted if there isn't enough space.
 
