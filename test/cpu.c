@@ -99,7 +99,7 @@ static void (far *g_old_int0d)(void);
 
 static void far isr_trap06(void)
 {
-    __emit__(0x0E, 0x1F);       /* PUSH CS; POP DS (?꽭洹몃㉫?듃 ?옱諛곗튂 ?뾾?씠 DS 蹂듦뎄) */
+    __emit__(0x0E, 0x1F);       /* PUSH CS; POP DS (세그먼트 재배치 없이 DS 복구) */
     g_tctx.trap_vec = 0x06;
     _SI = (uint16_t)&g_tctx;
     __emit__(
