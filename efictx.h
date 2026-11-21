@@ -97,4 +97,9 @@ static inline VOID bc_copy_mem(VOID *dst, const VOID *src, UINTN len)
     }
 }
 
+#ifdef SetMem
+#undef SetMem
+#endif
+#define SetMem(buf, len, val) bc_set_mem((buf), (len), (UINT8)(val))
+
 #endif /* EFICTX_H */
