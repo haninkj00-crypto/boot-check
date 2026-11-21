@@ -93,11 +93,18 @@ BOOTIA32.EFI: $(BUILD_DIR)/ia32/BOOTIA32.so
 
 # --- 기존 MBR FAT32 이미지 주입 및 QEMU 실행 ---
 inject: BOOTX64.EFI
-	mmd -D s -i "$(PART)" ::EFI ::EFI/BOOT </dev/null || true
-	mcopy -o -i "$(PART)" BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
-	@if [ -f BOOTIA32.EFI ]; then \
+	@set -eu; \
+	mdir -i "$(PART)" :: >/dev/null; \
+	if ! mdir -i "$(PART)" ::EFI >/dev/null 2>&1; then \
+		mmd -i "$(PART)" ::EFI; \
+	fi; \
+	if ! mdir -i "$(PART)" ::EFI/BOOT >/dev/null 2>&1; then \
+		mmd -i "$(PART)" ::EFI/BOOT; \
+	fi; \
+	mcopy -o -i "$(PART)" BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI; \
+	if [ -f BOOTIA32.EFI ]; then \
 		mcopy -o -i "$(PART)" BOOTIA32.EFI ::EFI/BOOT/BOOTIA32.EFI; \
-	fi
+	fi; \
 	mdir -i "$(PART)" ::EFI/BOOT
 
 run-x64: inject
