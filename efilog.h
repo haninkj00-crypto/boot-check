@@ -1,4 +1,4 @@
-﻿#ifndef EFILOG_H
+#ifndef EFILOG_H
 #define EFILOG_H
 
 #include "efictx.h"
@@ -14,5 +14,9 @@ VOID efilog_flush(efi_diag_ctx_t *ctx);
 
 /* 최종 플러시 후 EFILOG.TXT 및 루트 디렉터리 핸들 닫기 */
 VOID efilog_close(efi_diag_ctx_t *ctx);
+
+/* 로그 기록 실패 시 대응 */
+BOOLEAN efilog_has_error(const efi_diag_ctx_t *ctx);
+VOID    efilog_print_final_status(efi_diag_ctx_t *ctx);
 
 #endif /* EFILOG_H */
