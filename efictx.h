@@ -1,4 +1,4 @@
-﻿#ifndef EFICTX_H
+#ifndef EFICTX_H
 #define EFICTX_H
 
 #include <efi.h>
@@ -74,5 +74,27 @@ typedef struct {
     /* PC 스피커 */
     BOOLEAN spk_audible_or_partial;
 } efi_diag_ctx_t;
+
+static inline VOID bc_set_mem(VOID *dst, UINTN len, UINT8 val)
+{
+    volatile UINT8 *p = (volatile UINT8 *)dst;
+    while (len-- > 0U) {
+        *p++ = val;
+    }
+}
+
+static inline VOID bc_zero_mem(VOID *dst, UINTN len)
+{
+    bc_set_mem(dst, len, 0U);
+}
+
+static inline VOID bc_copy_mem(VOID *dst, const VOID *src, UINTN len)
+{
+    volatile UINT8       *d = (volatile UINT8 *)dst;
+    const volatile UINT8 *s = (const volatile UINT8 *)src;
+    while (len-- > 0U) {
+        *d++ = *s++;
+    }
+}
 
 #endif /* EFICTX_H */
