@@ -23,7 +23,7 @@ SECTOR_SIZE = 512
 MBR_PARTITION_TABLE_OFFSET = 446
 MBR_PARTITION_ENTRY_SIZE = 16
 MBR_PARTITION_COUNT = 4
-FAT32_TYPES = {0x0B, 0x0C}
+FAT32_TYPES = {0x0B, 0x0C, 0xEF}
 
 # 16-bit chainloader: relocate LBA 0 to 0x0600, find the active MBR
 # partition, load its VBR at 0000:7C00, then transfer control.
