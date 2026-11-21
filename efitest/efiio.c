@@ -1,4 +1,4 @@
-﻿#include "efictx.h"
+#include "efictx.h"
 #include "efilog.h"
 #include "efitxt.h"
 
@@ -15,6 +15,12 @@ static EFI_GUID kGuidLoadedImage =
 
 static EFI_GUID kGuidSimpleFs =
     { 0x964E5B22, 0x6459, 0x11d2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } };
+
+/* 상태 진단용 */
+static const char *g_log_init_stage    = "NOT_RUN";
+static EFI_STATUS  g_log_primary_st    = EFI_SUCCESS;
+static UINTN       g_log_fs_scanned    = 0;
+static UINT64      g_log_bytes_written = 0;
 
 /* -------------------------------------------------------------------------
  * 내부 헬퍼: IA32 -ffreestanding 환경에서 __udivdi3 없이 64비트 / 10 계산
@@ -77,12 +83,82 @@ static EFI_STATUS log_buf_commit(efi_diag_ctx_t *ctx)
         return g_log_io_status;
     }
 
+    g_log_bytes_written += (UINT64)write_sz;
     g_log_len -= write_sz;
     for (i = 0U; i < g_log_len; i++) {
         g_log_buf[i] = g_log_buf[write_sz + i];
     }
 
     return EFI_SUCCESS;
+}
+
+static BOOLEAN root_has_file(EFI_FILE_HANDLE root, const CHAR16 *path)
+{
+    EFI_FILE_HANDLE f = NULL;
+    EFI_STATUS      st;
+
+    st = uefi_call_wrapper(root->Open, 5,
+                           root, &f, (CHAR16 *)path,
+                           EFI_FILE_MODE_READ, 0);
+    if (!EFI_ERROR(st) && f != NULL) {
+        uefi_call_wrapper(f->Close, 1, f);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static EFI_STATUS open_bootcheck_root_fallback(EFI_BOOT_SERVICES *bs,
+                                               EFI_HANDLE         skip_handle,
+                                               EFI_FILE_HANDLE   *root_out)
+{
+    EFI_HANDLE *handles = NULL;
+    UINTN       count = 0;
+    UINTN       i;
+    EFI_STATUS  st;
+
+    g_log_fs_scanned = 0;
+    *root_out        = NULL;
+
+    st = uefi_call_wrapper(bs->LocateHandleBuffer, 5,
+                           ByProtocol, &kGuidSimpleFs, NULL,
+                           &count, &handles);
+    if (EFI_ERROR(st) || handles == NULL || count == 0U) {
+        return EFI_ERROR(st) ? st : EFI_NOT_FOUND;
+    }
+
+    g_log_fs_scanned = count;
+
+    for (i = 0U; i < count; i++) {
+        EFI_FILE_IO_INTERFACE *fs = NULL;
+        EFI_FILE_HANDLE        root = NULL;
+
+        if (handles[i] == skip_handle) {
+            continue;
+        }
+        st = uefi_call_wrapper(bs->HandleProtocol, 3,
+                               handles[i], &kGuidSimpleFs, (VOID **)&fs);
+        if (EFI_ERROR(st) || fs == NULL) {
+            continue;
+        }
+        st = uefi_call_wrapper(fs->OpenVolume, 2, fs, &root);
+        if (EFI_ERROR(st) || root == NULL) {
+            continue;
+        }
+
+        /* 호스트 OS ESP 오기록 방지: boot-check 볼륨 표식 파일 확인 */
+        if (root_has_file(root, L"START.COM") ||
+            root_has_file(root, L"RESULT.TXT") ||
+            root_has_file(root, L"EFILOG.TXT")) {
+            *root_out = root;
+            uefi_call_wrapper(bs->FreePool, 1, handles);
+            return EFI_SUCCESS;
+        }
+
+        uefi_call_wrapper(root->Close, 1, root);
+    }
+
+    uefi_call_wrapper(bs->FreePool, 1, handles);
+    return EFI_NOT_FOUND;
 }
 
 EFI_STATUS efilog_init(efi_diag_ctx_t *ctx)
@@ -92,10 +168,15 @@ EFI_STATUS efilog_init(efi_diag_ctx_t *ctx)
     EFI_FILE_IO_INTERFACE *fs = NULL;
     EFI_STATUS             st;
     UINT64                 pos = 0;
+    BOOLEAN                used_fallback = FALSE;
 
     g_log_len             = 0;
     g_log_io_failed       = FALSE;
     g_log_io_status       = EFI_SUCCESS;
+    g_log_init_stage      = "LoadedImage";
+    g_log_primary_st      = EFI_SUCCESS;
+    g_log_fs_scanned      = 0;
+    g_log_bytes_written   = 0;
     ctx->root_dir         = NULL;
     ctx->log_file         = NULL;
     ctx->log_ready        = FALSE;
@@ -106,6 +187,7 @@ EFI_STATUS efilog_init(efi_diag_ctx_t *ctx)
     st = uefi_call_wrapper(bs->HandleProtocol, 3,
                            ctx->image_handle, &kGuidLoadedImage, (VOID **)&loaded);
     if (EFI_ERROR(st) || loaded == NULL) {
+        g_log_primary_st     = st;
         ctx->log_init_status = st;
         return st;
     }
@@ -114,26 +196,41 @@ EFI_STATUS efilog_init(efi_diag_ctx_t *ctx)
     ctx->image_base      = (EFI_PHYSICAL_ADDRESS)(UINTN)loaded->ImageBase;
     ctx->image_size      = loaded->ImageSize;
 
+    /* 2. 기본 경로: LoadedImage->DeviceHandle에서 SimpleFileSystem 열기 */
     if (ctx->boot_dev_handle == NULL) {
-        ctx->log_init_status = EFI_NOT_FOUND;
-        return EFI_NOT_FOUND;
+        g_log_init_stage = "DeviceHandle=NULL";
+        g_log_primary_st = EFI_NOT_FOUND;
+        st               = EFI_NOT_FOUND;
+    } else {
+        st = uefi_call_wrapper(bs->HandleProtocol, 3,
+                               ctx->boot_dev_handle, &kGuidSimpleFs, (VOID **)&fs);
+        if (EFI_ERROR(st) || fs == NULL) {
+            g_log_init_stage = "HandleProtocol(SimpleFs)";
+            g_log_primary_st = st;
+        } else {
+            st = uefi_call_wrapper(fs->OpenVolume, 2, fs, &ctx->root_dir);
+            if (EFI_ERROR(st) || ctx->root_dir == NULL) {
+                g_log_init_stage = "OpenVolume";
+                g_log_primary_st = st;
+            }
+        }
     }
 
-    /* 2. 부팅 볼륨의 SimpleFileSystem 열기 */
-    st = uefi_call_wrapper(bs->HandleProtocol, 3,
-                           ctx->boot_dev_handle, &kGuidSimpleFs, (VOID **)&fs);
-    if (EFI_ERROR(st) || fs == NULL) {
-        ctx->log_init_status = st;
-        return st;
-    }
-
-    st = uefi_call_wrapper(fs->OpenVolume, 2, fs, &ctx->root_dir);
+    /* 2-b. 폴백 경로: GRUB chainloader 등으로 DeviceHandle 바인딩이 누락된 경우 */
     if (EFI_ERROR(st) || ctx->root_dir == NULL) {
-        ctx->log_init_status = st;
-        return st;
+        EFI_STATUS fb_st = open_bootcheck_root_fallback(bs,
+                                                        ctx->boot_dev_handle,
+                                                        &ctx->root_dir);
+        if (!EFI_ERROR(fb_st) && ctx->root_dir != NULL) {
+            used_fallback = TRUE;
+            st            = EFI_SUCCESS;
+        } else {
+            ctx->log_init_status = g_log_primary_st;
+            return g_log_primary_st;
+        }
     }
 
-    /* 3. 루트 디렉터리에 EFILOG.TXT 열기/생성 (RESULT.TXT 불간섭) */
+    /* 3. 루트 디렉터리에 EFILOG.TXT 열기/생성 */
     st = uefi_call_wrapper(ctx->root_dir->Open, 5,
                            ctx->root_dir,
                            &ctx->log_file,
@@ -143,6 +240,7 @@ EFI_STATUS efilog_init(efi_diag_ctx_t *ctx)
     if (EFI_ERROR(st) || ctx->log_file == NULL) {
         uefi_call_wrapper(ctx->root_dir->Close, 1, ctx->root_dir);
         ctx->root_dir        = NULL;
+        g_log_init_stage     = "Open(EFILOG.TXT)";
         ctx->log_init_status = st;
         return st;
     }
@@ -160,6 +258,7 @@ EFI_STATUS efilog_init(efi_diag_ctx_t *ctx)
 
     ctx->log_ready       = TRUE;
     ctx->log_init_status = EFI_SUCCESS;
+    g_log_init_stage     = used_fallback ? "OK(FallbackScan)" : "OK(DeviceHandle)";
 
     if (ctx->log_initial_size > 0) {
         ctx->log_appended = TRUE;
@@ -507,4 +606,41 @@ VOID efi_wait_any_key(efi_diag_ctx_t *ctx)
     uefi_call_wrapper(ctx->st->BootServices->WaitForEvent, 3,
                       1, &ctx->st->ConIn->WaitForKey, &index);
     uefi_call_wrapper(ctx->st->ConIn->ReadKeyStroke, 2, ctx->st->ConIn, &key);
+}
+
+BOOLEAN efilog_has_error(const efi_diag_ctx_t *ctx)
+{
+    if (ctx == NULL) {
+        return TRUE;
+    }
+    return (!ctx->log_ready || g_log_io_failed) ? TRUE : FALSE;
+}
+
+VOID efilog_print_final_status(efi_diag_ctx_t *ctx)
+{
+    efi_out_str(ctx, "\n[EFILOG Status] Stage=");
+    efi_out_str(ctx, g_log_init_stage);
+
+    if (g_log_fs_scanned > 0U) {
+        efi_out_str(ctx, ", SimpleFsScanned=");
+        efi_out_u64(ctx, (UINT64)g_log_fs_scanned);
+        efi_out_str(ctx, ", Primary=");
+        efi_out_status(ctx, g_log_primary_st);
+    }
+
+    if (!ctx->log_ready) {
+        efi_out_str(ctx, " | INIT FAILED: ");
+        efi_out_status(ctx, ctx->log_init_status);
+        efi_out_str(ctx, "\n");
+    } else if (g_log_io_failed) {
+        efi_out_str(ctx, " | WRITE/FLUSH FAILED: ");
+        efi_out_status(ctx, g_log_io_status);
+        efi_out_str(ctx, " (written=");
+        efi_out_u64(ctx, g_log_bytes_written);
+        efi_out_str(ctx, " B)\n");
+    } else {
+        efi_out_str(ctx, " | WRITTEN=");
+        efi_out_u64(ctx, g_log_bytes_written);
+        efi_out_str(ctx, " B\n");
+    }
 }
