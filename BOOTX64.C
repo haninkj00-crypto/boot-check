@@ -1,4 +1,4 @@
-﻿/*
+/*
  * BOOTX64.C - boot-check UEFI Diagnostic Entry Point & Table of Contents
  *
  * Build Toolchain : GNU-EFI (GCC + ld + objcopy)
@@ -96,15 +96,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* [Step 8] CPU 식별 및 안전 기능 검사 */
     efi_run_step8_cpu_features(&ctx);
 
-    /* 키 대기 전 로그 최종 플러시 및 닫기 (강제 전원 차단 시에도 기록 보존) */
-    efi_out_str(&ctx, "All active UEFI diagnostic steps finished. Closing EFILOG.TXT...\n");
-    efilog_close(&ctx);
+/* 키 대기 전 로그 최종 플러시 및 닫기 */
+    {
+        BOOLEAN log_err;
+        efi_out_str(&ctx, "All active UEFI diagnostic steps finished.\n");
+        efilog_flush(&ctx);
+        log_err = efilog_has_error(&ctx);
+        efilog_print_final_status(&ctx);
+        efilog_close(&ctx);
 
-    efi_run_radio_time_signal(&ctx);
-    /*
-    efi_out_str(&ctx, "Press any key to exit to firmware...\n");
-    efi_wait_any_key(&ctx);
-    */
+        efi_run_radio_time_signal(&ctx);
+        if (log_err) {
+            efi_out_str(&ctx, "EFILOG was NOT saved. Press any key to exit...\n");
+            efi_wait_any_key(&ctx);
+        }
+    }
 
     return EFI_SUCCESS;
 }
