@@ -53,6 +53,45 @@ static void irq1_hook(uint8_t enable)
 
     } else if (g_old_irq1 != 0) {
         *ivt09 = g_old_irq1;
+        g_old_irq1 = 0;
+    }
+
+    __emit__(0xFB); /* STI */
+}
+
+/* ---------------------------------------------------------
+- INT 1Ch (사용자 타이머 틱) 훅: BIOS Pause 루프 자동 탈출용
+- --------------------------------------------------------- */
+static volatile uint16_t g_pause_hits = 0;
+static void (interrupt far *g_old_int1c)(void);
+
+static void interrupt far int1c_unpause(void)
+{
+    if ((*bda_flag2 & 0x08) != 0) {
+        *bda_flag2 &= (uint8_t)~0x08;
+        g_pause_hits++;
+    }
+    g_old_int1c();
+}
+
+static void int1c_hook(uint8_t enable)
+{
+    void (interrupt far * far *ivt1c)(void) =
+        (void (interrupt far * far *)(void))MK_FP(0x0000, 0x0070);
+
+    uint16_t far *ivt_words = (uint16_t far *)ivt1c;
+    uint16_t handler_cs;
+
+    __emit__(0xFA); /* CLI */
+    handler_cs = _CS;
+
+    if (enable) {
+        g_old_int1c = *ivt1c;
+        ivt_words[0] = (uint16_t)(void near *)int1c_unpause;
+        ivt_words[1] = handler_cs;
+    } else if (g_old_int1c != 0) {
+        *ivt1c = g_old_int1c;
+        g_old_int1c = 0;
     }
 
     __emit__(0xFB); /* STI */
@@ -170,7 +209,13 @@ static uint8_t read_hold_flag(uint8_t grp, uint8_t mask)
     f_ah = _AH;
 
     if (grp == 1) return (uint8_t)((f_al & mask) != 0);         /* Shift/Ctrl/Alt */
-    if (grp == 2) return (uint8_t)((f_ah & mask) != 0);         /* Left Ctrl/Alt, SysRq, Locks */
+    /* if (grp == 2) return (uint8_t)((f_ah & mask) != 0);         Left Ctrl/Alt, SysRq, Locks */
+    if (grp == 2) {                                             /* Left Ctrl/Alt, SysRq, Locks */
+        if (mask == 0x80) {
+            return (uint8_t)(((f_ah & 0x80) != 0) || ((*bda_flag2 & 0x04) != 0));
+        }
+        return (uint8_t)((f_ah & mask) != 0);
+    }
     if (grp == 3) return (uint8_t)((*bda_flag3 & mask) != 0);   /* Right Ctrl(0x04)/Right Alt(0x08) */
     if (grp == 4) return (uint8_t)((*bda_flag2 & 0x08) != 0);   /* Pause latch */
     if (grp == 5) return (uint8_t)(*prtsc_stat != 0);           /* PrintScreen status */
@@ -238,6 +283,7 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
     uint32_t t0, t_hold;
     uint8_t  al, ah, sc, last_sc, triggered = 0;
     uint16_t make_hits = 0, int_hits = 0, flag_ticks = 0, tog_cnt = 0;
+    uint16_t prev_pause = 0;
     uint8_t  early_rel = 0, prev_irq = 0, prev_tog = 0;
     uint32_t prev_tick = 0;
 
@@ -248,6 +294,11 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
     if (grp == 5) {
         *prtsc_stat = 0;
     }
+    if (grp == 4) {
+        g_pause_hits = 0;
+        *bda_flag2 &= (uint8_t)~0x08;
+        int1c_hook(1);
+    }
 
     irq1_hook(1);
     g_irq1_hits = 0;
@@ -257,13 +308,19 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
     /* 1단계: 최대 10초(182틱) 동안 최초 입력 대기 */
     while ((*kbd_ticks - t0) < 182UL) {
         sc = inb(0x60);
-        if ((sc != last_sc && (sc == m1 || (m2 && sc == m2))) ||
-            (mask && read_hold_flag(grp, mask))) {
+        if (grp == 4) {
+            if (g_pause_hits > 0 || (*bda_flag2 & 0x08)) {
+                *bda_flag2 &= (uint8_t)~0x08;
+                triggered = 1;
+                break;
+            }
+        } else if ((sc != last_sc && ((m1 && sc == m1) || (m2 && sc == m2))) ||
+                   (mask && read_hold_flag(grp, mask))) {
             triggered = 1;
             break;
         }
         if (kbd_poll(&al, &ah)) {
-            if (ah == m1 || (m2 && ah == m2)) {
+            if (grp != 4 && ((m1 && ah == m1) || (m2 && ah == m2))) {
                 triggered = 1;
                 int_hits = 1;
                 break;
@@ -276,26 +333,37 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
 
     if (!triggered) {
         irq1_hook(0);
+        if (grp == 4) {
+            int1c_hook(0);
+            *bda_flag2 &= (uint8_t)~0x08;
+        }
         out_str("TIMEOUT (Not working)\n");
         unexp_flush_file(&u);
         return;
     }
 
     /* 2단계: 1.05초(19틱) 동안 메이크 코드 반복과 INT 16h 상태를 분리 계측 */
-    make_hits = 1;
-    prev_irq  = (uint8_t)g_irq1_hits;
-    prev_tog  = (uint8_t)(*bda_flag1 & mask);
-    prev_tick = *kbd_ticks;
-    t_hold    = prev_tick;
+    make_hits  = 1;
+    prev_irq   = (uint8_t)g_irq1_hits;
+    prev_pause = g_pause_hits;
+    prev_tog   = (uint8_t)(*bda_flag1 & mask);
+    prev_tick  = *kbd_ticks;
+    t_hold     = prev_tick;
 
     while ((*kbd_ticks - t_hold) < 19UL) {
         uint8_t cur_irq = (uint8_t)g_irq1_hits;
         sc = inb(0x60);
 
-        /* 메이크 코드 도달 확인 (IRQ1 증가 + Port 0x60 메이크 코드 일치) */
-        if (cur_irq != prev_irq) {
+        if (grp == 4) {
+            /* Pause: BIOS 래치 재발동 여부로 반복 계측 (0xC5 오판 방지) */
+            uint16_t cur_pause = g_pause_hits;
+            if (cur_pause != prev_pause) {
+                make_hits += (uint16_t)(cur_pause - prev_pause);
+                prev_pause = cur_pause;
+            }
+        } else if (cur_irq != prev_irq) {
             prev_irq = cur_irq;
-            if (sc == m1 || (m2 && sc == m2)) {
+            if ((m1 && sc == m1) || (m2 && sc == m2)) {
                 make_hits++;
             } else if ((m1 && sc == (uint8_t)(m1 | 0x80)) ||
                        (m2 && sc == (uint8_t)(m2 | 0x80))) {
@@ -305,15 +373,13 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
             }
         }
 
-        /* INT 16h 버퍼 키 입력 반복 확인 */
         if (kbd_poll(&al, &ah)) {
             int_hits++;
         }
 
-        /* INT 16h AH=12h / BDA 홀드 플래그 및 토글 유지 틱 계측 */
         if (*kbd_ticks != prev_tick) {
             prev_tick = *kbd_ticks;
-            if (mask && read_hold_flag(grp, mask)) {
+            if (grp != 4 && mask && read_hold_flag(grp, mask)) {
                 flag_ticks++;
             }
             if (is_tog && ((*bda_flag1 & mask) != prev_tog)) {
@@ -323,8 +389,12 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
         }
     }
     irq1_hook(0);
+    if (grp == 4) {
+        int1c_hook(0);
+        *bda_flag2 &= (uint8_t)~0x08;
+    }
 
-    /* 3단계: 메이크 코드 / 인터럽트 결과 및 종합 판정 기록 */
+    /* 3단계: 결과 출력 */
     out_str("Make=");
     if (make_hits == 0)      out_str("NONE");
     else if (make_hits == 1) out_str("1-SHOT");
@@ -334,7 +404,9 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
     if (is_tog && tog_cnt > 1) {
         out_str(",tog="); out_ulong(tog_cnt);
     }
-    out_str(",flag="); out_str((flag_ticks >= 15) ? "YES" : "NO");
+    out_str(",flag=");
+    if (grp == 4) out_str("LATCH");
+    else          out_str((flag_ticks >= 15) ? "YES" : "NO");
     out_str(") -> ");
 
     if (flag_ticks >= 15 && (make_hits > 1 || int_hits > 1 || tog_cnt > 1)) {
@@ -505,7 +577,7 @@ void run_kbd_test(void)
     run_hold_key("  [1.13] Hold Menu Key (1s+)         : ", 0x5D, 0,    0, 0x00, 0);
     run_hold_key("  [1.14] Hold Pause/Break (1s+)      : ", 0x45, 0,    4, 0x08, 0);
     run_hold_key("  [1.15] Hold Print Screen (1s+)     : ", 0x37, 0,    5, 0x01, 0);
-    run_hold_key("  [1.16] Hold SysRq (1s+)            : ", 0x54, 0,    2, 0x04, 0);
+    run_hold_key("  [1.16] Hold SysRq (1s+)            : ", 0x54, 0,    2, 0x80, 0);
     run_hold_key("  [1.17] Hold Windows/Super (1s+)    : ", 0x5B, 0x5C, 0, 0x00, 0);
 
     /* 3. 국가별 언어 전환 키 구분 (KR / JP / Intl) */
