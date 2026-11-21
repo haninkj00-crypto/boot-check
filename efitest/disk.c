@@ -1,4 +1,4 @@
-﻿#include "efictx.h"
+#include "efictx.h"
 #include "efilog.h"
 #include "efitxt.h"
 
@@ -401,13 +401,18 @@ static BOOLEAN inspect_simple_fs(efi_diag_ctx_t *ctx,
     }
 
     st = uefi_call_wrapper(root->GetInfo, 4, root, &kGuidFsInfo, &info_sz, NULL);
-    if (st == EFI_BUFFER_TOO_SMALL && info_sz >= sizeof(bc_fs_info_t) && info_sz <= 4096U) {
-        st = uefi_call_wrapper(bs->AllocatePool, 3, EfiLoaderData, info_sz, (VOID **)&info_buf);
+    if (st == EFI_BUFFER_TOO_SMALL && info_sz >= 38U && info_sz <= 4096U) {
+        UINTN alloc_sz = (info_sz < sizeof(bc_fs_info_t)) ? sizeof(bc_fs_info_t) : info_sz;
+        alloc_sz += sizeof(CHAR16); /* 볼륨 레이블 NUL 종단 안전 여유 */
+
+        st = uefi_call_wrapper(bs->AllocatePool, 3, EfiLoaderData, alloc_sz, (VOID **)&info_buf);
         if (!EFI_ERROR(st) && info_buf != NULL) {
-            st = uefi_call_wrapper(root->GetInfo, 4, root, &kGuidFsInfo, &info_sz, info_buf);
+            UINTN req_sz = alloc_sz - sizeof(CHAR16);
+            bc_zero_mem(info_buf, alloc_sz);
+            st = uefi_call_wrapper(root->GetInfo, 4, root, &kGuidFsInfo, &req_sz, info_buf);
             if (!EFI_ERROR(st)) {
                 const bc_fs_info_t *fi = (const bc_fs_info_t *)info_buf;
-                efi_out_str(ctx, "MOUNTABLE (FAT/EFI FS) | Label=\"");
+                efi_out_str(ctx, "MOUNTABLE (SimpleFS) | Label=\"");
                 efi_out_wstr(ctx, fi->VolumeLabel);
                 efi_out_str(ctx, "\" | Vol=");
                 efi_out_size_human(ctx, fi->VolumeSize);
