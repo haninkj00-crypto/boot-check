@@ -1,4 +1,4 @@
-﻿#ifndef EFITXT_H
+#ifndef EFITXT_H
 #define EFITXT_H
 
 #include "efictx.h"
