@@ -55,7 +55,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     ctx.image_handle         = ImageHandle;
     ctx.st                   = SystemTable;
     ctx.allow_connect_rescan = FALSE;
-    ctx.allow_gop_setmode    = FALSE;
+    ctx.allow_gop_setmode    = TRUE;
 
     /* [Step 0] UEFI 환경 · 텍스트 콘솔 · EFILOG.TXT 초기화 */
     efi_run_step0_console_and_log(&ctx);
@@ -105,12 +105,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         efilog_print_final_status(&ctx);
         efilog_close(&ctx);
 
-        efi_run_radio_time_signal(&ctx);
         if (log_err) {
-            efi_out_str(&ctx, "EFILOG was NOT saved. Press any key to exit...\n");
+            efi_out_str(&ctx, "EFILOG was NOT saved. Press any key to enter clock monitor...\n");
             efi_wait_any_key(&ctx);
         }
+        efi_run_radio_time_signal(&ctx);
     }
-
     return EFI_SUCCESS;
 }

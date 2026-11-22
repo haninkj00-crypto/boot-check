@@ -9,6 +9,7 @@ extern void out_hex16(uint16_t val);
 extern void out_ulong(uint32_t val);
 extern void log_str(const char *s);
 extern uint8_t inb(uint16_t port);
+extern void outb(uint16_t port, uint8_t val);
 
 static volatile uint32_t far *kbd_ticks =
     (volatile uint32_t far *)MK_FP(0x0040, 0x006C);
@@ -23,14 +24,20 @@ static volatile uint8_t far *prtsc_stat =
 
 /* ---------------------------------------------------------
  * IRQ 1 (INT 09h) 하드웨어 스캔코드 도달 카운터 (비파괴 체인)
+ * BIOS 핸들러를 먼저 실행해 스캔코드 탈취를 방지한다.
  * --------------------------------------------------------- */
 static volatile uint16_t g_irq1_hits = 0;
+static volatile uint8_t  g_irq1_last_sc = 0;
 static void (interrupt far *g_old_irq1)(void);
 
 static void interrupt far irq1_spy(void)
 {
-    g_irq1_hits++;
     g_old_irq1();
+    __emit__(0xFA); /* CLI: 0x64 확인과 0x60 읽기 사이 재진입 방지 */
+    if ((inb(0x64) & 0x01U) == 0) {
+        g_irq1_last_sc = inb(0x60);
+    }
+    g_irq1_hits++;
 }
 
 static void irq1_hook(uint8_t enable)
@@ -46,11 +53,8 @@ static void irq1_hook(uint8_t enable)
 
     if (enable) {
         g_old_irq1 = *ivt09;
-
-        /* IVT[09h] = CS:OFFSET(irq1_spy) */
         ivt_words[0] = (uint16_t)(void near *)irq1_spy;
         ivt_words[1] = handler_cs;
-
     } else if (g_old_irq1 != 0) {
         *ivt09 = g_old_irq1;
         g_old_irq1 = 0;
@@ -60,8 +64,8 @@ static void irq1_hook(uint8_t enable)
 }
 
 /* ---------------------------------------------------------
-- INT 1Ch (사용자 타이머 틱) 훅: BIOS Pause 루프 자동 탈출용
-- --------------------------------------------------------- */
+ * INT 1Ch (사용자 타이머 틱) 훅: BIOS Pause 루프 자동 탈출용
+ * --------------------------------------------------------- */
 static volatile uint16_t g_pause_hits = 0;
 static void (interrupt far *g_old_int1c)(void);
 
@@ -209,7 +213,6 @@ static uint8_t read_hold_flag(uint8_t grp, uint8_t mask)
     f_ah = _AH;
 
     if (grp == 1) return (uint8_t)((f_al & mask) != 0);         /* Shift/Ctrl/Alt */
-    /* if (grp == 2) return (uint8_t)((f_ah & mask) != 0);         Left Ctrl/Alt, SysRq, Locks */
     if (grp == 2) {                                             /* Left Ctrl/Alt, SysRq, Locks */
         if (mask == 0x80) {
             return (uint8_t)(((f_ah & 0x80) != 0) || ((*bda_flag2 & 0x04) != 0));
@@ -223,25 +226,45 @@ static uint8_t read_hold_flag(uint8_t grp, uint8_t mask)
 }
 
 /* ---------------------------------------------------------
- * 통합 테스트 엔진 1: 일반 단일 키 / BDA 토글 키 (10초 타임아웃)
+ * 통합 테스트 엔진 1: 일반 단일 키 / BDA 토글 키 (순수 BIOS INT 16h)
  * --------------------------------------------------------- */
 static uint8_t run_single_key(const char *label, uint8_t mode, uint8_t p1, uint8_t p2, uint8_t *out_sc)
 {
     struct unexp_log u;
-    uint32_t t0 = *kbd_ticks;
-    uint8_t al, ah, sc, last_sc, step = 0;
+    uint32_t t0;
+    uint8_t al, ah, step = 0;
+    uint8_t init_nl = 0, need_flip = 0, seen_flip = 0;
 
     u.count = 0;
     u.suppress_sc = 0;
     out_str(label);
     kbd_drain();
-    last_sc = inb(0x60);
 
+    if (mode == 1) {
+        init_nl = (uint8_t)(*bda_flag1 & 0x20U);
+        if (init_nl == p1) {
+            need_flip = 1;
+            out_str("(already set: press 2x) ");
+        }
+    }
+
+    t0 = *kbd_ticks;
     while ((*kbd_ticks - t0) < 182UL) {
-        sc = inb(0x60);
-        if (mode == 1 && (*bda_flag1 & 0x20) == p1) {       /* NumLock ON/OFF */
-            out_str("PASS\n");
-            return 1;
+        if (mode == 1) {                                    /* NumLock ON/OFF 실제 변화 판정 */
+            uint8_t cur_nl = (uint8_t)(*bda_flag1 & 0x20U);
+            if (!need_flip) {
+                if (cur_nl == p1) {
+                    out_str("PASS\n");
+                    return 1;
+                }
+            } else {
+                if (!seen_flip && cur_nl != init_nl) {
+                    seen_flip = 1;
+                } else if (seen_flip && cur_nl == p1) {
+                    out_str("PASS (toggled)\n");
+                    return 1;
+                }
+            }
         }
         if (kbd_poll(&al, &ah)) {
             if (mode == 2) {                                /* 'a' then Enter */
@@ -266,25 +289,28 @@ static uint8_t run_single_key(const char *label, uint8_t mode, uint8_t p1, uint8
             u.suppress_sc = ah;
             unexp_add(&u, 1, al, ah);
         }
-        track_p60_unexp(&u, sc, &last_sc);
     }
 
-    out_str("TIMEOUT\n");
+    if (mode == 1 && need_flip) {
+        out_str(seen_flip ? "TIMEOUT (toggled 1x only)\n" : "TIMEOUT (no toggle)\n");
+    } else {
+        out_str("TIMEOUT\n");
+    }
     unexp_flush_file(&u);
     return 0;
 }
 
 /* ---------------------------------------------------------
- * 통합 테스트 엔진 2: 특수 키 1초 이상 홀드 감지 (인터럽트 + 메이크 코드 분리)
+ * 통합 테스트 엔진 2: 특수 키 1초 이상 홀드 감지 (IRQ1 스파이 + INT 16h)
  * --------------------------------------------------------- */
 static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp, uint8_t mask, uint8_t is_tog)
 {
     struct unexp_log u;
     uint32_t t0, t_hold;
-    uint8_t  al, ah, sc, last_sc, triggered = 0;
+    uint8_t  al, ah, last_sc = 0, triggered = 0;
     uint16_t make_hits = 0, int_hits = 0, flag_ticks = 0, tog_cnt = 0;
-    uint16_t prev_pause = 0;
-    uint8_t  early_rel = 0, prev_irq = 0, prev_tog = 0;
+    uint16_t prev_pause = 0, prev_irq = 0;
+    uint8_t  early_rel = 0, prev_tog = 0;
     uint32_t prev_tick = 0;
 
     u.count = 0;
@@ -300,25 +326,36 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
         int1c_hook(1);
     }
 
+    g_irq1_hits    = 0;
+    g_irq1_last_sc = 0;
     irq1_hook(1);
-    g_irq1_hits = 0;
-    last_sc = inb(0x60);
+    prev_irq = 0;
     t0 = *kbd_ticks;
 
     /* 1단계: 최대 10초(182틱) 동안 최초 입력 대기 */
     while ((*kbd_ticks - t0) < 182UL) {
-        sc = inb(0x60);
+        uint16_t cur_irq = g_irq1_hits;
+        uint8_t  sc = 0;
+        uint8_t  got_irq = 0;
+
+        if (cur_irq != prev_irq) {
+            prev_irq = cur_irq;
+            sc       = g_irq1_last_sc;
+            got_irq  = 1;
+        }
+
         if (grp == 4) {
             if (g_pause_hits > 0 || (*bda_flag2 & 0x08)) {
                 *bda_flag2 &= (uint8_t)~0x08;
                 triggered = 1;
                 break;
             }
-        } else if ((sc != last_sc && ((m1 && sc == m1) || (m2 && sc == m2))) ||
-                   (mask && read_hold_flag(grp, mask))) {
+        } else if ((mask && read_hold_flag(grp, mask)) ||
+                   (got_irq && ((m1 && sc == m1) || (m2 && sc == m2)))) {
             triggered = 1;
             break;
         }
+
         if (kbd_poll(&al, &ah)) {
             if (grp != 4 && ((m1 && ah == m1) || (m2 && ah == m2))) {
                 triggered = 1;
@@ -328,7 +365,10 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
             u.suppress_sc = ah;
             unexp_add(&u, 1, al, ah);
         }
-        track_p60_unexp(&u, sc, &last_sc);
+
+        if (got_irq) {
+            track_p60_unexp(&u, sc, &last_sc);
+        }
     }
 
     if (!triggered) {
@@ -342,26 +382,25 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
         return;
     }
 
-    /* 2단계: 1.05초(19틱) 동안 메이크 코드 반복과 INT 16h 상태를 분리 계측 */
+    /* 2단계: 1.05초(19틱) 동안 메이크 반복과 INT 16h 상태 분리 계측 */
     make_hits  = 1;
-    prev_irq   = (uint8_t)g_irq1_hits;
+    prev_irq   = g_irq1_hits;
     prev_pause = g_pause_hits;
     prev_tog   = (uint8_t)(*bda_flag1 & mask);
     prev_tick  = *kbd_ticks;
     t_hold     = prev_tick;
 
     while ((*kbd_ticks - t_hold) < 19UL) {
-        uint8_t cur_irq = (uint8_t)g_irq1_hits;
-        sc = inb(0x60);
+        uint16_t cur_irq = g_irq1_hits;
 
         if (grp == 4) {
-            /* Pause: BIOS 래치 재발동 여부로 반복 계측 (0xC5 오판 방지) */
             uint16_t cur_pause = g_pause_hits;
             if (cur_pause != prev_pause) {
                 make_hits += (uint16_t)(cur_pause - prev_pause);
                 prev_pause = cur_pause;
             }
         } else if (cur_irq != prev_irq) {
+            uint8_t sc = g_irq1_last_sc;
             prev_irq = cur_irq;
             if ((m1 && sc == m1) || (m2 && sc == m2)) {
                 make_hits++;
@@ -424,8 +463,6 @@ static void run_hold_key(const char *label, uint8_t m1, uint8_t m2, uint8_t grp,
     out_str("\n");
 }
 
-extern void outb(uint16_t port, uint8_t val);
-
 static uint16_t read_pit0(void)
 {
     uint16_t v;
@@ -446,7 +483,7 @@ static uint8_t ps2_wait_ibf_clear(void)
     return 0;
 }
 
-/* 8042 출력 버퍼에서 1바이트 읽기 (timeout_ticks = PIT 1.193MHz 틱 단위) */
+/* 8042 출력 버퍼에서 키보드 1바이트 읽기 (AUX/마우스 바이트 제외, PIT 1.193MHz 틱 단위) */
 static uint8_t ps2_read_byte(uint32_t timeout_ticks, uint8_t *out_val, uint32_t *elapsed_ticks)
 {
     uint16_t prev = read_pit0();
@@ -455,15 +492,20 @@ static uint8_t ps2_read_byte(uint32_t timeout_ticks, uint8_t *out_val, uint32_t 
 
     while (el < timeout_ticks && g++ < 200000UL) {
         uint16_t cur = read_pit0();
+        uint8_t  st_reg;
         el += (uint16_t)(prev - cur);
         prev = cur;
 
-        if ((inb(0x64) & 0x01) != 0) {
-            *out_val = inb(0x60);
-            if (elapsed_ticks) {
-                *elapsed_ticks = el;
+        st_reg = inb(0x64);
+        if ((st_reg & 0x01U) != 0) {
+            uint8_t val = inb(0x60);
+            if ((st_reg & 0x20U) == 0) {        /* AUXB=0: 키보드 데이터만 채택 */
+                *out_val = val;
+                if (elapsed_ticks) {
+                    *elapsed_ticks = el;
+                }
+                return 1;
             }
-            return 1;
         }
     }
     if (elapsed_ticks) {
@@ -559,7 +601,7 @@ void run_kbd_test(void)
 
     detect_kbd_interface();
 
-    /* 1. 기본 키 및 넘패드/펑션키 */
+    /* 1. 기본 키 및 넘패드/펑션키 (순수 BIOS INT 16h) */
     run_single_key("  [1.1] Type 'a' then PRESS ENTER!   : ", 2, 0,    0,    0);
     run_single_key("  [1.2] Turn NumLock ON              : ", 1, 0x20, 0,    0);
     run_single_key("  [1.3] Press Numpad 0               : ", 3, '0',  0x52, 0);
@@ -568,7 +610,7 @@ void run_kbd_test(void)
     run_single_key("  [1.6] Turn off NumLock Now         : ", 1, 0x00, 0,    0);
     run_single_key("  [1.7] Biggest F-key (F12/F11/F10)  : ", 3, 0xFF, 0xFE, 0);
 
-    /* 2. 특수 키 1초 이상 홀드 진단 (메이크 코드 + 인터럽트 분리 계측) */
+    /* 2. 특수 키 1초 이상 홀드 진단 (IRQ1 스파이 + INT 16h) */
     run_hold_key("  [1.8]  Hold Left Shift (1s+)       : ", 0x2A, 0,    1, 0x02, 0);
     run_hold_key("  [1.9]  Hold Right Shift (1s+)      : ", 0x36, 0,    1, 0x01, 0);
     run_hold_key("  [1.10] Hold Right Ctrl (1s+)       : ", 0x1D, 0,    3, 0x04, 0);
@@ -580,46 +622,53 @@ void run_kbd_test(void)
     run_hold_key("  [1.16] Hold SysRq (1s+)            : ", 0x54, 0,    2, 0x80, 0);
     run_hold_key("  [1.17] Hold Windows/Super (1s+)    : ", 0x5B, 0x5C, 0, 0x00, 0);
 
-    /* 3. 국가별 언어 전환 키 구분 (KR / JP / Intl) */
+    /* 3. 국가별 언어 전환 키 구분 (IRQ1 비파괴 관찰 + BIOS 입력) */
     out_str("  [1.18] Language Key (KR/JP/Intl)   : ");
-    u.count = 0; u.suppress_sc = 0;
-    kbd_drain();
-    last_sc = inb(0x60);
-    t0 = *kbd_ticks;
-    step = 0;
-    while ((*kbd_ticks - t0) < 182UL) {
-        sc = inb(0x60);
-        if (sc != last_sc) {
-            if      (sc == 0xF2 || sc == 0x72) { out_str("PASS (KR Hangul 0xF2)\n"); step = 1; break; }
-            else if (sc == 0xF1 || sc == 0x71) { out_str("PASS (KR Hanja 0xF1)\n");  step = 1; break; }
-            else if (sc == 0x79)               { out_str("PASS (JP Henkan 0x79)\n"); step = 1; break; }
-            else if (sc == 0x7B)               { out_str("PASS (JP Muhenkan 0x7B)\n"); step = 1; break; }
-            else if (sc == 0x70)               { out_str("PASS (JP Kana 0x70)\n");   step = 1; break; }
-            else if (sc == 0x29)               { out_str("PASS (JP Zenkaku/Grave 0x29)\n"); step = 1; break; }
+    {
+        uint16_t prev_irq = 0;
+        u.count = 0; u.suppress_sc = 0;
+        last_sc = 0;
+        kbd_drain();
+        g_irq1_hits    = 0;
+        g_irq1_last_sc = 0;
+        irq1_hook(1);
+        t0 = *kbd_ticks;
+        step = 0;
+        while ((*kbd_ticks - t0) < 182UL) {
+            uint16_t cur_irq = g_irq1_hits;
+            if (cur_irq != prev_irq) {
+                prev_irq = cur_irq;
+                sc = g_irq1_last_sc;
+                if      (sc == 0xF2 || sc == 0x72) { out_str("PASS (KR Hangul 0xF2)\n"); step = 1; break; }
+                else if (sc == 0xF1 || sc == 0x71) { out_str("PASS (KR Hanja 0xF1)\n");  step = 1; break; }
+                else if (sc == 0x79)               { out_str("PASS (JP Henkan 0x79)\n"); step = 1; break; }
+                else if (sc == 0x7B)               { out_str("PASS (JP Muhenkan 0x7B)\n"); step = 1; break; }
+                else if (sc == 0x70)               { out_str("PASS (JP Kana 0x70)\n");   step = 1; break; }
+                else if (sc == 0x29)               { out_str("PASS (JP Zenkaku/Grave 0x29)\n"); step = 1; break; }
+                track_p60_unexp(&u, sc, &last_sc);
+            }
+            if (kbd_poll(&al, &ah)) {
+                u.suppress_sc = ah;
+                unexp_add(&u, 1, al, ah);
+            }
         }
-        if (kbd_poll(&al, &ah)) {
-            u.suppress_sc = ah;
-            unexp_add(&u, 1, al, ah);
+        irq1_hook(0);
+        if (!step) {
+            out_str("TIMEOUT\n");
+            unexp_flush_file(&u);
         }
-        track_p60_unexp(&u, sc, &last_sc);
-    }
-    if (!step) {
-        out_str("TIMEOUT\n");
-        unexp_flush_file(&u);
     }
 
-    /* 4. 전용 방향키 4방향 (E0 프리픽스만 허용) */
+    /* 4. 전용 방향키 4방향 (순수 BIOS INT 16h, E0 프리픽스만 허용) */
     out_str("  [1.19] Dedicated Arrows (U/D/L/R)  : ");
     {
         const uint8_t d_sc[4] = { 0x48, 0x50, 0x4B, 0x4D };
         const char   *d_nm[4] = { "U ", "D ", "L ", "R " };
         u.count = 0; u.suppress_sc = 0;
         kbd_drain();
-        last_sc = inb(0x60);
         step = 0;
         t0 = *kbd_ticks;
         while (step < 4 && (*kbd_ticks - t0) < 182UL) {
-            sc = inb(0x60);
             if (kbd_poll(&al, &ah)) {
                 if (al == 0xE0 && ah == d_sc[step]) {
                     out_str(d_nm[step++]);
@@ -628,7 +677,6 @@ void run_kbd_test(void)
                     unexp_add(&u, 1, al, ah);
                 }
             }
-            track_p60_unexp(&u, sc, &last_sc);
         }
         if (step == 4) {
             out_str("-> PASS\n\n");
@@ -637,4 +685,5 @@ void run_kbd_test(void)
             unexp_flush_file(&u);
         }
     }
+    kbd_drain();
 }

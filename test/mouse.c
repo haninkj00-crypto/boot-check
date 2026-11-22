@@ -21,12 +21,14 @@ static volatile uint32_t far *ms_ticks =
 #define M_BIOS_PS2  1   /* BIOS INT 15h AH=C2h 콜백 방식 */
 #define M_RAW_8042  2   /* 8042 보조 포트(0x64/0x60) 직접 폴링 방식 */
 #define M_SERIAL    3   /* RS-232 COM 포트 Microsoft/Logitech 프로토콜 */
+#define M_INT33     4   /* DOS INT 33h 마우스 드라이버 방식 */
 
 static uint8_t  g_ms_mode = M_NONE;
 static uint8_t  g_ms_dev_id = 0xFF;
 static uint8_t  g_ms_res = 0;
 static uint8_t  g_ms_rate = 0;
-static uint8_t  g_int33_vec = 0;
+static uint8_t  g_int33_vec = 0;        /* 0=없음/IRET, 1=스텁, 2=실제 드라이버(0xFFFF) */
+static uint16_t g_int33_btns = 0;
 static uint8_t  g_bda_ps2_bit = 0;
 
 /* 8042 / Serial 백업용 상태 */
@@ -58,14 +60,15 @@ static void out_long(long val)
 
 /* ---------------------------------------------------------
  * 1. BIOS INT 15h AH=C2h Far 콜백 핸들러 (cdecl -> RETF, 호출자 스택 정리)
+ *    BIOS는 status, X, Y, Z 순으로 푸시 -> cdecl은 역순(z, y, x, st)으로 수신
  * --------------------------------------------------------- */
-void far cdecl bios_ps2_cb(uint16_t st, uint16_t x_raw, uint16_t y_raw, uint16_t z_raw)
+void far cdecl bios_ps2_cb(uint16_t z_raw, uint16_t y_raw, uint16_t x_raw, uint16_t st)
 {
     uint8_t s_byte;
     int     dx, dy;
 
-    /* IRQ12 문맥에서 진입하므로 DS를 현재 CS(.COM 데이터 세그먼트)로 정렬 */
-    __emit__(0x1E, 0x0E, 0x1F);     /* PUSH DS; PUSH CS; POP DS */
+    /* IRQ12 문맥 보호: AX/BX/CX/DX/ES/DS 전부 보존 후 DS=CS(.COM 데이터 세그먼트) 설정 */
+    __emit__(0x50, 0x53, 0x51, 0x52, 0x06, 0x1E, 0x0E, 0x1F);
 
     (void)z_raw;
     s_byte = (uint8_t)(st & 0xFFU);
@@ -81,65 +84,138 @@ void far cdecl bios_ps2_cb(uint16_t st, uint16_t x_raw, uint16_t y_raw, uint16_t
         g_pkt_count++;
     }
 
-    __emit__(0x1F);                 /* POP DS */
+    /* 보존한 DS/ES/DX/CX/BX/AX 역순 복원 */
+    __emit__(0x1F, 0x07, 0x5A, 0x59, 0x5B, 0x58);
 }
 
 /* ---------------------------------------------------------
- * 2. BIOS PS/2 인터페이스 초기화 (INT 15h AH=C2h)
+ * 2. INT 15h AH=C2h / INT 33h 원자적 레지스터 호출 헬퍼
  * --------------------------------------------------------- */
+struct int_regs_es {
+    uint16_t ax;        /* +0 */
+    uint16_t bx;        /* +2 */
+    uint16_t cx;        /* +4 */
+    uint16_t dx;        /* +6 */
+    uint16_t es;        /* +8 */
+    uint8_t  cf;        /* +10 */
+};
+
+static void call_int15_c2(struct int_regs_es *r)
+{
+    _SI = (uint16_t)r;
+    __emit__(
+        0x55,                   /* PUSH BP */
+        0x56,                   /* PUSH SI */
+        0x57,                   /* PUSH DI */
+        0x1E,                   /* PUSH DS */
+        0x06,                   /* PUSH ES */
+        0x8E, 0x44, 0x08,       /* MOV ES, [SI+8] */
+        0x8B, 0x04,             /* MOV AX, [SI] */
+        0x8B, 0x5C, 0x02,       /* MOV BX, [SI+2] */
+        0x8B, 0x4C, 0x04,       /* MOV CX, [SI+4] */
+        0x8B, 0x54, 0x06,       /* MOV DX, [SI+6] */
+        0xCD, 0x15,             /* INT 15h */
+        0x07,                   /* POP ES */
+        0x1F,                   /* POP DS */
+        0x5F,                   /* POP DI */
+        0x5E,                   /* POP SI */
+        0x5D,                   /* POP BP */
+        0x89, 0x04,             /* MOV [SI], AX */
+        0x89, 0x5C, 0x02,       /* MOV [SI+2], BX */
+        0x89, 0x4C, 0x04,       /* MOV [SI+4], CX */
+        0x89, 0x54, 0x06,       /* MOV [SI+6], DX */
+        0x18, 0xC0,             /* SBB AL, AL */
+        0x88, 0x44, 0x0A        /* MOV [SI+10], AL */
+    );
+}
+
+static void call_int33(struct int_regs_es *r)
+{
+    _SI = (uint16_t)r;
+    __emit__(
+        0x55, 0x56, 0x57, 0x1E, 0x06,
+        0x8B, 0x04,
+        0x8B, 0x5C, 0x02,
+        0x8B, 0x4C, 0x04,
+        0x8B, 0x54, 0x06,
+        0xCD, 0x33,             /* INT 33h */
+        0x07, 0x1F, 0x5F, 0x5E, 0x5D,
+        0x89, 0x04,
+        0x89, 0x5C, 0x02,
+        0x89, 0x4C, 0x04,
+        0x89, 0x54, 0x06,
+        0x18, 0xC0,
+        0x88, 0x44, 0x0A
+    );
+}
+
+static uint8_t init_int33_mouse(void)
+{
+    struct int_regs_es r;
+
+    if (g_int33_vec == 0) {
+        return 0;
+    }
+
+    r.ax = 0x0000U; r.bx = 0; r.cx = 0; r.dx = 0; r.es = 0; r.cf = 0;
+    call_int33(&r);
+    if (r.ax != 0xFFFFU) {
+        return 0;
+    }
+
+    g_int33_vec  = 2;
+    g_int33_btns = (r.bx == 0xFFFFU) ? 2U : r.bx;
+
+    /* 초기 누적 이동 카운터 비우기 (AX=000Bh) */
+    r.ax = 0x000BU; r.bx = 0; r.cx = 0; r.dx = 0;
+    call_int33(&r);
+    return 1;
+}
+
 static uint8_t init_bios_ps2(void)
 {
-    uint8_t cf, ah_ret, bh_ret, bl_ret, cl_ret, dl_ret;
-    uint16_t cb_off, cb_seg;
+    struct int_regs_es r;
 
     /* C205h: Pointing Device 초기화 (패킷 크기 3바이트) */
-    _BH = 0x03;
-    _AX = 0xC205;
-    __emit__(0x55, 0x56, 0x57, 0x06, 0xCD, 0x15, 0x07, 0x5F, 0x5E, 0x5D);
-    cf = (uint8_t)(_FLAGS & 0x0001);
-    ah_ret = _AH;
-    if (cf != 0 || ah_ret != 0) {
+    r.ax = 0xC205U; r.bx = 0x0300U; r.cx = 0; r.dx = 0; r.es = _DS; r.cf = 0;
+    call_int15_c2(&r);
+    if (r.cf != 0 || (r.ax & 0xFF00U) != 0) {
         return 0;
     }
 
     /* C201h: 마우스 리셋 및 장치 ID 확인 */
-    _AX = 0xC201;
-    __emit__(0x55, 0x56, 0x57, 0x06, 0xCD, 0x15, 0x07, 0x5F, 0x5E, 0x5D);
-    cf = (uint8_t)(_FLAGS & 0x0001);
-    bh_ret = _BH;
-    bl_ret = _BL;
-    if (cf != 0 || bh_ret != 0xAA) {
+    r.ax = 0xC201U; r.bx = 0; r.cx = 0; r.dx = 0; r.es = _DS; r.cf = 0;
+    call_int15_c2(&r);
+    if (r.cf != 0 || ((r.bx >> 8) & 0xFFU) != 0xAAU) {
         return 0;
     }
-    g_ms_dev_id = bl_ret;
+    g_ms_dev_id = (uint8_t)(r.bx & 0xFFU);
 
     /* C206h: 현재 해상도 및 샘플링 레이트 조회 */
-    _BH = 0x00;
-    _AX = 0xC206;
-    __emit__(0x55, 0x56, 0x57, 0x06, 0xCD, 0x15, 0x07, 0x5F, 0x5E, 0x5D);
-    if ((_FLAGS & 0x0001) == 0) {
-        cl_ret = _CL;
-        dl_ret = _DL;
-        g_ms_res  = cl_ret;
-        g_ms_rate = dl_ret;
+    r.ax = 0xC206U; r.bx = 0x0000U; r.cx = 0; r.dx = 0; r.es = _DS; r.cf = 0;
+    call_int15_c2(&r);
+    if (r.cf == 0) {
+        g_ms_res  = (uint8_t)(r.cx & 0xFFU);
+        g_ms_rate = (uint8_t)(r.dx & 0xFFU);
     }
 
     /* C207h: Far 콜백 주소 등록 (ES:BX) */
-    cb_off = (uint16_t)(void near *)bios_ps2_cb;
-    cb_seg = _CS;
-    _ES = cb_seg;
-    _BX = cb_off;
-    _AX = 0xC207;
-    __emit__(0x55, 0x56, 0x57, 0x06, 0xCD, 0x15, 0x07, 0x5F, 0x5E, 0x5D);
-    if ((_FLAGS & 0x0001) != 0) {
+    r.ax = 0xC207U;
+    r.bx = (uint16_t)(void near *)bios_ps2_cb;
+    r.cx = 0; r.dx = 0;
+    r.es = _CS;
+    r.cf = 0;
+    call_int15_c2(&r);
+    if (r.cf != 0) {
         return 0;
     }
 
     /* C200h: 포인팅 디바이스 활성화 (BH=01h) */
-    _BH = 0x01;
-    _AX = 0xC200;
-    __emit__(0x55, 0x56, 0x57, 0x06, 0xCD, 0x15, 0x07, 0x5F, 0x5E, 0x5D);
-    if ((_FLAGS & 0x0001) != 0) {
+    r.ax = 0xC200U; r.bx = 0x0100U; r.cx = 0; r.dx = 0; r.es = _DS; r.cf = 0;
+    call_int15_c2(&r);
+    if (r.cf != 0) {
+        r.ax = 0xC207U; r.bx = 0; r.cx = 0; r.dx = 0; r.es = 0; r.cf = 0;
+        call_int15_c2(&r);
         return 0;
     }
 
@@ -181,11 +257,22 @@ static uint8_t aux_send_cmd(uint8_t cmd, uint8_t *ack_out)
     return kbc_wait_read(ack_out);
 }
 
+static void restore_8042_cmd(void)
+{
+    if (g_has_8042_cmd && kbc_wait_write()) {
+        outb(0x64, 0x60);
+        if (kbc_wait_write()) {
+            outb(0x60, g_orig_8042_cmd);
+        }
+    }
+}
+
 static uint8_t init_raw_8042_ps2(void)
 {
     uint8_t cmd_byte, ack, id_byte, test_res;
     uint8_t g = 0;
 
+    g_has_8042_cmd = 0;
     if (inb(0x64) == 0xFF) {
         return 0;
     }
@@ -212,12 +299,17 @@ static uint8_t init_raw_8042_ps2(void)
     }
 
     /* AUX 포트 활성화(0xA8) 및 인터페이스 테스트(0xA9) */
-    if (!kbc_wait_write()) { __emit__(0xFB); return 0; }
+    if (!kbc_wait_write()) {
+        restore_8042_cmd();
+        __emit__(0xFB);
+        return 0;
+    }
     outb(0x64, 0xA8);
 
     if (kbc_wait_write()) {
         outb(0x64, 0xA9);
         if (!kbc_wait_read(&test_res) || test_res != 0x00) {
+            restore_8042_cmd();
             __emit__(0xFB);
             return 0;
         }
@@ -230,6 +322,7 @@ static uint8_t init_raw_8042_ps2(void)
         }
     }
     if (!aux_send_cmd(0xF4, &ack) || ack != 0xFA) {
+        restore_8042_cmd();
         __emit__(0xFB);
         return 0;
     }
@@ -308,7 +401,7 @@ static uint16_t probe_serial_mouse(char *id_out)
 }
 
 /* ---------------------------------------------------------
- * 폴링 기반 패킷 처리기 (M_RAW_8042 / M_SERIAL 공용)
+ * 폴링 기반 패킷 처리기 (M_RAW_8042 / M_SERIAL / M_INT33 공용)
  * --------------------------------------------------------- */
 static void pump_mouse_packets(void)
 {
@@ -362,6 +455,25 @@ static void pump_mouse_packets(void)
                 }
             }
         }
+    } else if (g_ms_mode == M_INT33) {
+        struct int_regs_es r;
+        int dx, dy;
+
+        r.ax = 0x0003U; r.bx = 0; r.cx = 0; r.dx = 0;
+        call_int33(&r);
+        g_btn_state = (uint8_t)(r.bx & 0x07U);
+
+        r.ax = 0x000BU; r.bx = 0; r.cx = 0; r.dx = 0;
+        call_int33(&r);
+        dx = (int)r.cx;
+        dy = (int)r.dx;
+        if (dx != 0 || dy != 0) {
+            g_sum_dx   += (long)dx;
+            g_sum_dy   += (long)dy;
+            g_abs_move += (uint32_t)((dx < 0) ? -dx : dx) +
+                          (uint32_t)((dy < 0) ? -dy : dy);
+            g_pkt_count++;
+        }
     }
 }
 
@@ -373,17 +485,14 @@ static void cleanup_mouse(void)
     uint8_t ack;
 
     if (g_ms_mode == M_BIOS_PS2) {
-        _BH = 0x00;
-        _AX = 0xC200;               /* Disable pointing device */
-        __emit__(0x55, 0x56, 0x57, 0x06, 0xCD, 0x15, 0x07, 0x5F, 0x5E, 0x5D);
+        struct int_regs_es r;
+        r.ax = 0xC200U; r.bx = 0x0000U; r.cx = 0; r.dx = 0; r.es = _DS; r.cf = 0;
+        call_int15_c2(&r);          /* Disable pointing device */
+        r.ax = 0xC207U; r.bx = 0x0000U; r.cx = 0; r.dx = 0; r.es = 0; r.cf = 0;
+        call_int15_c2(&r);          /* Clear far callback */
     } else if (g_ms_mode == M_RAW_8042) {
         (void)aux_send_cmd(0xF5, &ack);
-        if (g_has_8042_cmd && kbc_wait_write()) {
-            outb(0x64, 0x60);
-            if (kbc_wait_write()) {
-                outb(0x60, g_orig_8042_cmd);
-            }
-        }
+        restore_8042_cmd();
     } else if (g_ms_mode == M_SERIAL && g_ser_base != 0) {
         outb(g_ser_base + 4U, 0x00);
     }
@@ -529,10 +638,16 @@ void run_mouse_test(void)
     uint16_t far *equip = (uint16_t far *)MK_FP(0x0040, 0x0010);
     uint8_t  far *entry33;
 
-    g_ms_mode   = M_NONE;
-    g_ms_dev_id = 0xFF;
-    g_btn_state = 0;
-    g_pkt_count = 0;
+    g_ms_mode    = M_NONE;
+    g_ms_dev_id  = 0xFF;
+    g_ms_res     = 0;
+    g_ms_rate    = 0;
+    g_int33_vec  = 0;
+    g_int33_btns = 0;
+    g_ser_base   = 0;
+    g_ser_id[0]  = '\0';
+    g_btn_state  = 0;
+    g_pkt_count  = 0;
 
     /* 1. 펌웨어 / 벡터 / 포트 인터페이스 수집 */
     g_bda_ps2_bit = (uint8_t)((*equip & 0x0004U) != 0);
@@ -543,20 +658,27 @@ void run_mouse_test(void)
         }
     }
 
-    g_ser_base = probe_serial_mouse(g_ser_id);
-
-    if (init_bios_ps2()) {
-        g_ms_mode = M_BIOS_PS2;
-    } else if (init_raw_8042_ps2()) {
-        g_ms_mode = M_RAW_8042;
-    } else if (g_ser_base != 0) {
-        g_ms_mode = M_SERIAL;
+    if (init_int33_mouse()) {
+        g_ms_mode = M_INT33;
+    } else {
+        g_ser_base = probe_serial_mouse(g_ser_id);
+        if (init_bios_ps2()) {
+            g_ms_mode = M_BIOS_PS2;
+        } else if (init_raw_8042_ps2()) {
+            g_ms_mode = M_RAW_8042;
+        } else if (g_ser_base != 0) {
+            g_ms_mode = M_SERIAL;
+        }
     }
 
     /* 2. 인터페이스 수집 결과 출력 및 기록 */
     out_str("=== [Step 6] Mouse Interface & Input Check ===\n");
     out_str("  BDA PS/2 Flag   : "); out_str(g_bda_ps2_bit ? "INSTALLED\n" : "CLEAR\n");
-    out_str("  INT 33h Driver  : "); out_str(g_int33_vec ? "HOOKED\n" : "NONE (Bare-metal)\n");
+    out_str("  INT 33h Driver  : ");
+    if (g_int33_vec == 2)      out_str("ACTIVE (AX=FFFFh)\n");
+    else if (g_int33_vec == 1) out_str("STUB ONLY (AX!=FFFFh)\n");
+    else                       out_str("NONE (Bare-metal)\n");
+
     out_str("  Serial Mouse    : ");
     if (g_ser_base != 0) {
         out_str("DETECTED at 0x"); out_hex16(g_ser_base);
@@ -566,7 +688,11 @@ void run_mouse_test(void)
     }
 
     out_str("  Active Backend  : ");
-    if (g_ms_mode == M_BIOS_PS2) {
+    if (g_ms_mode == M_INT33) {
+        out_str("DOS INT 33h DRIVER (Buttons=");
+        out_ulong(g_int33_btns);
+        out_str(")\n\n");
+    } else if (g_ms_mode == M_BIOS_PS2) {
         out_str("BIOS PS/2 INT 15h C2h (DevID=0x");
         out_hex16(g_ms_dev_id);
         out_str(", Res="); out_ulong(g_ms_res);

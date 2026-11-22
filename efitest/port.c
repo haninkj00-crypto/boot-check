@@ -1,4 +1,4 @@
-﻿#include "efilog.h"
+#include "efilog.h"
 #include "efitxt.h"
 #include "../efi_spkio.h"
 

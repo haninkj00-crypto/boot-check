@@ -41,6 +41,14 @@ struct e820_ctx {
     uint8_t  buf[24];
 };
 
+struct int15_regs {
+    uint16_t ax;        /* +0 */
+    uint16_t bx;        /* +2 */
+    uint16_t cx;        /* +4 */
+    uint16_t dx;        /* +6 */
+    uint8_t  cf;        /* +8 */
+};
+
 struct mem_report {
     uint16_t cpu_gen;           /* 86, 286, 386 */
 
@@ -310,36 +318,50 @@ static void call_int15_e820(struct e820_ctx *ctx)
     );
 }
 
+static void call_int15_16(struct int15_regs *r)
+{
+    _SI = (uint16_t)r;
+    __emit__(
+        0x55,                   /* PUSH BP */
+        0x56,                   /* PUSH SI */
+        0x8B, 0x04,             /* MOV AX, [SI] */
+        0x8B, 0x5C, 0x02,       /* MOV BX, [SI+2] */
+        0x8B, 0x4C, 0x04,       /* MOV CX, [SI+4] */
+        0x8B, 0x54, 0x06,       /* MOV DX, [SI+6] */
+        0xCD, 0x15,             /* INT 15h */
+        0x5E,                   /* POP SI */
+        0x5D,                   /* POP BP */
+        0x89, 0x04,             /* MOV [SI], AX */
+        0x89, 0x5C, 0x02,       /* MOV [SI+2], BX */
+        0x89, 0x4C, 0x04,       /* MOV [SI+4], CX */
+        0x89, 0x54, 0x06,       /* MOV [SI+6], DX */
+        0x18, 0xC0,             /* SBB AL, AL */
+        0x88, 0x44, 0x08        /* MOV [SI+8], AL */
+    );
+}
+
 static void probe_extended_mem(void)
 {
-    uint16_t r_ax, r_bx, r_cx, r_dx;
-    uint8_t  cf;
+    struct int15_regs r;
 
     if (g_mem.cpu_gen < 286) {
         return;
     }
 
     /* 5-1. INT 15h AH=88h (최대 64MB 확장 메모리 KB) */
-    _AH = 0x88;
-    __emit__(0x55, 0xCD, 0x15, 0x5D);
-    cf   = (uint8_t)(_FLAGS & 0x0001);
-    r_ax = _AX;
-    if (cf == 0 && r_ax > 0 && r_ax < 0xFFFFU) {
+    r.ax = 0x8800U; r.bx = 0; r.cx = 0; r.dx = 0; r.cf = 0;
+    call_int15_16(&r);
+    if (r.cf == 0 && r.ax > 0 && r.ax < 0xFFFFU) {
         g_mem.has_int15_88 = 1;
-        g_mem.ext88_kb = r_ax;
+        g_mem.ext88_kb = r.ax;
     }
 
     /* 5-2. INT 15h AX=E801h (1MB~16MB 및 16MB~4GB) */
-    _AX = 0xE801;
-    __emit__(0x55, 0xCD, 0x15, 0x5D);
-    cf   = (uint8_t)(_FLAGS & 0x0001);
-    r_ax = _AX;
-    r_bx = _BX;
-    r_cx = _CX;
-    r_dx = _DX;
-    if (cf == 0) {
-        uint16_t low_kb  = (r_ax != 0) ? r_ax : r_cx;
-        uint16_t high_64 = (r_bx != 0) ? r_bx : r_dx;
+    r.ax = 0xE801U; r.bx = 0; r.cx = 0; r.dx = 0; r.cf = 0;
+    call_int15_16(&r);
+    if (r.cf == 0) {
+        uint16_t low_kb  = (r.ax == 0 && r.bx == 0) ? r.cx : r.ax;
+        uint16_t high_64 = (r.ax == 0 && r.bx == 0) ? r.dx : r.bx;
         if (low_kb > 0 || high_64 > 0) {
             g_mem.has_e801 = 1;
             g_mem.e801_total_kb = (uint32_t)low_kb + ((uint32_t)high_64 << 6);
@@ -348,7 +370,6 @@ static void probe_extended_mem(void)
             }
         }
     }
-
     /* 5-3. INT 15h EAX=E820h (386 이상 전용, >=4GB 상위 주소 무시) */
     if (g_mem.cpu_gen >= 386) {
         struct e820_ctx ctx;
@@ -597,8 +618,13 @@ void run_mem_test(void)
         out_str(" - 0x0009FFFF : Extended BIOS Data Area (EBDA)\n");
     }
     if (g_mem.int12_conv_kb < 640U) {
-        out_str("  - 0x"); out_hex32((uint32_t)g_mem.int12_conv_kb << 10);
-        out_str(" - 0x0009FFFF : Unpopulated Conventional Gap (<640KB)\n");
+        uint32_t conv_end   = (uint32_t)g_mem.int12_conv_kb << 10;
+        uint32_t ebda_start = g_mem.ebda_seg ? ((uint32_t)g_mem.ebda_seg << 4) : 0xA0000UL;
+        if (conv_end < ebda_start) {
+            out_str("  - 0x"); out_hex32(conv_end);
+            out_str(" - 0x"); out_hex32(ebda_start - 1UL);
+            out_str(" : Unpopulated Conventional Gap (<640KB)\n");
+        }
     }
     out_str("  - 0x000A0000 - 0x000BFFFF : VGA/MDA Video VRAM Aperture\n");
     for (i = 0; i < g_mem.rom_count; i++) {

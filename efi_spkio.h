@@ -1,4 +1,4 @@
-﻿#ifndef BOOT_CHECK_SPKIO_H
+#ifndef BOOT_CHECK_SPKIO_H
 #define BOOT_CHECK_SPKIO_H
 
 #include "efictx.h"

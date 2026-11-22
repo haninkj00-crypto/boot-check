@@ -1,4 +1,4 @@
-﻿#include "efictx.h"
+#include "efictx.h"
 #include "efilog.h"
 #include "efitxt.h"
 
@@ -380,51 +380,150 @@ static VOID check_handle_edid(efi_diag_ctx_t *ctx, EFI_BOOT_SERVICES *bs, EFI_HA
 /* -------------------------------------------------------------------------
  * [C] 선택적 GOP SetMode() 전환 테스트 (기본 비활성; 실행 전 Flush 필수)
  * ------------------------------------------------------------------------- */
+static VOID draw_lfb_test_bar(const bc_gop_mode_t *gm)
+{
+    const bc_gop_mode_info_t *mi;
+    UINT64 fb_base, fb_sz, req_bytes;
+    volatile UINT32 *fb;
+    UINT32 y_start, y_end, y, x, w, stride, bar_h;
+    UINT32 c_red, c_grn, c_blu;
+
+    if (gm == NULL || gm->Info == NULL) {
+        return;
+    }
+    mi = gm->Info;
+    if (mi->PixelFormat == BC_PIXEL_BLT_ONLY) {
+        return;
+    }
+    fb_base = (UINT64)gm->FrameBufferBase;
+    fb_sz   = (UINT64)gm->FrameBufferSize;
+    if (fb_base == 0ULL || mi->HorizontalResolution == 0U ||
+        mi->VerticalResolution == 0U || mi->PixelsPerScanLine == 0U) {
+        return;
+    }
+#if !EFI_IS_X64
+    if (fb_base > 0xFFFFFFFFULL) {
+        return;
+    }
+#endif
+
+    if (mi->PixelFormat == BC_PIXEL_RGBX_8BPC) {
+        c_red = 0x000000FFU;
+        c_grn = 0x0000FF00U;
+        c_blu = 0x00FF0000U;
+    } else if (mi->PixelFormat == BC_PIXEL_BITMASK) {
+        c_red = mi->PixelInformation.RedMask;
+        c_grn = mi->PixelInformation.GreenMask;
+        c_blu = mi->PixelInformation.BlueMask;
+    } else {
+        /* BC_PIXEL_BGRX_8BPC 기본 */
+        c_red = 0x00FF0000U;
+        c_grn = 0x0000FF00U;
+        c_blu = 0x000000FFU;
+    }
+
+    w      = mi->HorizontalResolution;
+    stride = mi->PixelsPerScanLine;
+    bar_h  = (mi->VerticalResolution < 16U) ? mi->VerticalResolution : 16U;
+
+    /* ConOut 상단 텍스트를 가리지 않도록 가급적 화면 하단 16px에 표시 */
+    req_bytes = (UINT64)mi->VerticalResolution * (UINT64)stride * 4ULL;
+    if (req_bytes <= fb_sz) {
+        y_start = mi->VerticalResolution - bar_h;
+        y_end   = mi->VerticalResolution;
+    } else {
+        req_bytes = (UINT64)bar_h * (UINT64)stride * 4ULL;
+        if (req_bytes > fb_sz) {
+            return;
+        }
+        y_start = 0U;
+        y_end   = bar_h;
+    }
+
+    fb = (volatile UINT32 *)(UINTN)fb_base;
+    for (y = y_start; y < y_end; y++) {
+        for (x = 0U; x < w; x++) {
+            UINT32 color = (x < (w / 3U)) ? c_red :
+                           (x < ((w * 2U) / 3U)) ? c_grn : c_blu;
+            fb[(UINTN)(y * stride + x)] = color;
+        }
+    }
+    __asm__ __volatile__ ("" ::: "memory");
+}
+
 static VOID optional_setmode_test(efi_diag_ctx_t *ctx,
                                   EFI_BOOT_SERVICES *bs,
                                   bc_gop_t *gop,
                                   UINT32 orig_mode,
                                   UINT32 max_mode)
 {
-    UINT32 target = orig_mode;
-    UINT32 m;
-    EFI_STATUS st_set, st_rest;
+    UINT32     m, lim;
+    EFI_STATUS st_rest;
 
     if (!ctx->allow_gop_setmode) {
-        efi_out_str(ctx, "    SetMode Test     : SKIPPED (Default read-only mode)\n");
+        efi_out_str(ctx, "    SetMode Test     : SKIPPED (Disabled)\n");
         return;
     }
 
-    if (max_mode < 2U) {
-        efi_out_str(ctx, "    SetMode Test     : SKIPPED (Only 1 mode available)\n");
+    if (max_mode == 0U) {
+        efi_out_str(ctx, "    SetMode Test     : SKIPPED (No modes available)\n");
         return;
     }
 
-    for (m = 0; m < max_mode && m < GOP_MAX_MODES_GUARD; m++) {
-        if (m != orig_mode) {
-            target = m;
-            break;
+    lim = (max_mode > GOP_MAX_MODES_GUARD) ? GOP_MAX_MODES_GUARD : max_mode;
+
+    efi_out_str(ctx, "    SetMode Test     : Cycling ALL ");
+    efi_out_u64(ctx, (UINT64)lim);
+    efi_out_str(ctx, " modes (3s each, auto-restore to #");
+    efi_out_u64(ctx, (UINT64)orig_mode);
+    efi_out_str(ctx, ")\n");
+    efilog_flush(ctx);
+
+    for (m = 0U; m < lim; m++) {
+        EFI_STATUS st_set;
+
+        efi_out_str(ctx, "      -> Mode #");
+        efi_out_u64_pad2(ctx, (UINT64)m);
+        if (m == orig_mode) {
+            efi_out_str(ctx, " (orig)");
+        }
+        efi_out_str(ctx, " : ");
+        efilog_flush(ctx);
+
+        st_set = uefi_call_wrapper(gop->SetMode, 2, gop, m);
+        efi_out_status(ctx, st_set);
+
+        if (!EFI_ERROR(st_set) && gop->Mode != NULL && gop->Mode->Info != NULL) {
+            const bc_gop_mode_info_t *mi = gop->Mode->Info;
+            efi_out_str(ctx, " | Live=");
+            efi_out_u64(ctx, (UINT64)mi->HorizontalResolution);
+            efi_out_str(ctx, "x");
+            efi_out_u64(ctx, (UINT64)mi->VerticalResolution);
+            efi_out_str(ctx, " ");
+            efi_out_str(ctx, pixel_fmt_short(mi->PixelFormat));
+            efi_out_str(ctx, " Pitch=");
+            efi_out_u64(ctx, (UINT64)mi->PixelsPerScanLine);
+            efi_out_str(ctx, " LFB=0x");
+            efi_out_hex64(ctx, (UINT64)gop->Mode->FrameBufferBase);
+            efi_out_str(ctx, " Sz=");
+            efi_out_size_human(ctx, (UINT64)gop->Mode->FrameBufferSize);
+            efi_out_str(ctx, "\n");
+            efilog_flush(ctx);
+
+            draw_lfb_test_bar(gop->Mode);
+            if (bs->Stall != NULL) {
+                uefi_call_wrapper(bs->Stall, 1, (UINTN)3000000U);
+            }
+        } else {
+            efi_out_str(ctx, "\n");
+            efilog_flush(ctx);
         }
     }
 
-    efi_out_str(ctx, "    SetMode Test     : Switching Mode ");
-    efi_out_u64(ctx, (UINT64)orig_mode);
-    efi_out_str(ctx, " -> ");
-    efi_out_u64(ctx, (UINT64)target);
-    efi_out_str(ctx, " -> ");
-    efi_out_u64(ctx, (UINT64)orig_mode);
-    efi_out_str(ctx, "...\n");
-    efilog_flush(ctx);
-
-    st_set = uefi_call_wrapper(gop->SetMode, 2, gop, target);
-    if (!EFI_ERROR(st_set) && bs->Stall != NULL) {
-        uefi_call_wrapper(bs->Stall, 1, (UINTN)500000U);
-    }
     st_rest = uefi_call_wrapper(gop->SetMode, 2, gop, orig_mode);
-
-    efi_out_str(ctx, "    SetMode Result   : Switch=");
-    efi_out_status(ctx, st_set);
-    efi_out_str(ctx, ", Restore=");
+    efi_out_str(ctx, "    SetMode Restore  : #");
+    efi_out_u64(ctx, (UINT64)orig_mode);
+    efi_out_str(ctx, " -> ");
     efi_out_status(ctx, st_rest);
     efi_out_str(ctx, "\n");
     efilog_flush(ctx);
