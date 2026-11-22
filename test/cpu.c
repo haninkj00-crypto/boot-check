@@ -216,6 +216,20 @@ static uint8_t exec_guarded(void (*step_fn)(void))
     return g_tctx.trap_vec;
 }
 
+static void cpu_kbd_drain(void)
+{
+    uint8_t g = 0;
+    while (g++ < 32) {
+        _AH = 0x01;
+        __emit__(0xCD, 0x16);
+        if ((_FLAGS & 0x0040) != 0) {
+            break;
+        }
+        _AH = 0x00;
+        __emit__(0xCD, 0x16);
+    }
+}
+
 /* ---------------------------------------------------------
  * [Test 01] FLAGS / EFLAGS 비트 단계별 판별 (8086 -> 286 -> 386 -> 486 -> CPUID)
  * --------------------------------------------------------- */
@@ -771,9 +785,10 @@ struct gdtr_ptr {
     uint32_t base;
 };
 
-static struct gdt_entry g_gdt[4];
+static struct gdt_entry g_gdt[5];
 static struct gdtr_ptr  g_gdtr;
 static uint8_t          g_bios_gdtr[6];
+static uint8_t          g_tss32[104];
 
 static void set_gdt_desc(uint8_t idx, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran)
 {
@@ -797,6 +812,9 @@ static void build_test_gdt(void)
     set_gdt_desc(2, cs_phys, 0x0000FFFFUL, 0x92U, 0x00U);
     /* 0x18: 32-bit Flat Data Segment (Base = 0, Limit = 4GB, G=1, D/B=1) */
     set_gdt_desc(3, 0UL,     0x000FFFFFUL, 0x92U, 0xCFU);
+    /* 0x20: 32-bit Available TSS (Base = g_tss32, Limit = 103, Access = 0x89) */
+    set_gdt_desc(4, cs_phys + (uint32_t)(uint16_t)g_tss32,
+                 (uint32_t)(sizeof(g_tss32) - 1U), 0x89U, 0x00U);
 
     g_gdtr.limit = sizeof(g_gdt) - 1U;
     g_gdtr.base  = cs_phys + (uint32_t)(uint16_t)g_gdt;
@@ -1241,19 +1259,378 @@ static void test14_pm_paging(void)
 }
 
 /* ---------------------------------------------------------
+ * [Test 15] Virtual 8086 Mode (32-bit TSS / IDT / #GP Emulation / Paged V86)
+ * --------------------------------------------------------- */
+struct idt_entry {
+    uint16_t ofs_lo;
+    uint16_t sel;
+    uint8_t  zero;
+    uint8_t  type_attr;
+    uint16_t ofs_hi;
+};
+
+struct v86_ctx {
+    uint16_t save_sp;        /* +0x00 */
+    uint16_t save_bp;        /* +0x02 */
+    uint16_t resume_ip;      /* +0x04 : Far JMP offset */
+    uint16_t real_cs;        /* +0x06 : Far JMP segment & V86 CS/DS/SS */
+    uint16_t v86_flag;       /* +0x08 : V86 CLI 직전 기록(0x5638) */
+    uint16_t v86_resumed;    /* +0x0A : #GP IRETD 복귀 후 기록(0x4F4B) */
+    uint8_t  cli_trapped;    /* +0x0C */
+    uint8_t  hlt_trapped;    /* +0x0D */
+    uint8_t  unexp_vec;      /* +0x0E */
+    uint8_t  unexp_op;       /* +0x0F */
+    uint32_t trap_eflags;    /* +0x10 */
+    uint32_t trap_err;       /* +0x14 */
+    uint16_t trap_eip;       /* +0x18 */
+    uint16_t trap_cnt;       /* +0x1A */
+    uint16_t v86_entry_ip;   /* +0x1C */
+    uint16_t v86_init_sp;    /* +0x1E */
+    uint16_t gdtr_ofs;       /* +0x20 */
+    uint16_t idtr_ofs;       /* +0x22 */
+    uint32_t cr0_or_mask;    /* +0x24 : 0 (PG=0) or 0x80000000 (PG=1) */
+};
+
+static struct idt_entry g_v86_idt[32];
+static struct gdtr_ptr  g_v86_idtr;
+static uint8_t          g_bios_idtr[6];
+static uint8_t          g_v86_r0_stk[128];
+static uint8_t          g_v86_u_stk[64];
+static struct v86_ctx   g_v86_ctx;
+
+/* Ring-3 V86 페이로드 (CS=DS=SS=real_cs, IOPL=0, VM=1)
+ *   MOV BX, &g_v86_ctx          (ofs 0x01 패치)
+ *   MOV WORD PTR [BX+08h], 5638h
+ *   CLI                         -> #GP 트랩 #1 (모니터가 EIP++ 후 IRETD 복귀)
+ *   MOV WORD PTR [BX+0Ah], 4F4Bh
+ *   HLT                         -> #GP 트랩 #2 (리얼모드 복원)
+ *   JMP SHORT $
+ */
+static uint8_t g_v86_payload[17] = {
+    0xBB, 0x00, 0x00,
+    0xC7, 0x47, 0x08, 0x38, 0x56,
+    0xFA,
+    0xC7, 0x47, 0x0A, 0x4B, 0x4F,
+    0xF4,
+    0xEB, 0xFE
+};
+
+/* Ring-0 #GP 모니터(0x00) + SDM 9.9.2 복원 루틴(0x51) + 기타 예외 탈출구(0x7D)
+ *   &g_v86_ctx 오프셋 패치 위치: 0x0B, 0x83
+ */
+static uint8_t g_v86_gp_isr[139] = {
+    /* 0x00: PUSHA; MOV BP, SP; MOV AX, 0010h; MOV DS, AX; MOV ES, AX; MOV SI, &g_v86_ctx */
+    0x60, 0x89, 0xE5, 0xB8, 0x10, 0x00, 0x8E, 0xD8, 0x8E, 0xC0, 0xBE, 0x00, 0x00,
+    /* 0x0D: INC WORD [SI+1Ah]; CMP WORD [SI+1Ah], 4; JA do_exit(0x51) */
+    0xFF, 0x44, 0x1A, 0x83, 0x7C, 0x1A, 0x04, 0x77, 0x3B,
+    /* 0x16: trap_err=[BP+10h], trap_eflags=[BP+1Ch] */
+    0x66, 0x8B, 0x46, 0x10, 0x66, 0x89, 0x44, 0x14,
+    0x66, 0x8B, 0x46, 0x1C, 0x66, 0x89, 0x44, 0x10,
+    /* 0x26: BX=V86 EIP([BP+14h]); trap_eip=BX; AL=[BX]; CMP AL, 0FAh(CLI); JNE 0x40 */
+    0x8B, 0x5E, 0x14, 0x89, 0x5C, 0x18, 0x8A, 0x07, 0x3C, 0xFA, 0x75, 0x0E,
+    /* 0x32: cli_trapped=1; INC DWORD [BP+14h]; POPA; ADD SP, 4; IRETD */
+    0xC6, 0x44, 0x0C, 0x01, 0x66, 0xFF, 0x46, 0x14, 0x61, 0x83, 0xC4, 0x04, 0x66, 0xCF,
+    /* 0x40: CMP AL, 0F4h(HLT); JNE 0x4A; hlt_trapped=1; JMP do_exit(0x51) */
+    0x3C, 0xF4, 0x75, 0x06, 0xC6, 0x44, 0x0D, 0x01, 0xEB, 0x07,
+    /* 0x4A: unexp_vec=0Dh; unexp_op=AL (fallthrough -> do_exit) */
+    0xC6, 0x44, 0x0E, 0x0D, 0x88, 0x44, 0x0F,
+    /* 0x51 (do_exit): 세그먼트 0x10 정규화 */
+    0xB8, 0x10, 0x00, 0x8E, 0xE0, 0x8E, 0xE8, 0x8E, 0xD0, 0x8E, 0xD8, 0x8E, 0xC0,
+    /* 0x5E: PG=0 -> CR3=0 -> PE=0 -> JMP FAR [SI+4] (real_cs:resume_ip) */
+    0x0F, 0x20, 0xC0, 0x66, 0x25, 0xFF, 0xFF, 0xFF, 0x7F, 0x0F, 0x22, 0xC0,
+    0xEB, 0x00, 0x66, 0x31, 0xC0, 0x0F, 0x22, 0xD8,
+    0x0F, 0x20, 0xC0, 0x24, 0xFE, 0x0F, 0x22, 0xC0,
+    0xFF, 0x6C, 0x04,
+    /* 0x7D (err_entry): 비-#GP 예외 포착 -> unexp_vec=0FEh -> JMP do_exit(0x51) */
+    0xB8, 0x10, 0x00, 0x8E, 0xD8, 0xBE, 0x00, 0x00,
+    0xC6, 0x44, 0x0E, 0xFE, 0xEB, 0xC6
+};
+
+static void setup_v86_tables(void)
+{
+    uint32_t cs_phys = ((uint32_t)_CS) << 4;
+    uint16_t ctx_ofs = (uint16_t)&g_v86_ctx;
+    uint16_t gp_ofs  = (uint16_t)g_v86_gp_isr;
+    uint16_t err_ofs = (uint16_t)(gp_ofs + 0x7DU);
+    uint16_t i;
+
+    for (i = 0; i < sizeof(g_tss32); i++) {
+        g_tss32[i] = 0;
+    }
+    *(uint32_t *)(g_tss32 + 4)   = (uint32_t)(uint16_t)(g_v86_r0_stk + sizeof(g_v86_r0_stk));
+    *(uint16_t *)(g_tss32 + 8)   = 0x0010U; /* SS0 = 16-bit Ring-0 Data */
+    *(uint16_t *)(g_tss32 + 102) = (uint16_t)sizeof(g_tss32); /* IOPB 없음 -> IOPL=0 I/O 트랩 */
+
+    build_test_gdt(); /* 0x20 TSS Busy 비트도 0x89로 초기화됨 */
+
+    for (i = 0; i < 32U; i++) {
+        g_v86_idt[i].ofs_lo    = (i == 13U) ? gp_ofs : err_ofs;
+        g_v86_idt[i].sel       = 0x0008U;
+        g_v86_idt[i].zero      = 0;
+        g_v86_idt[i].type_attr = 0x8EU;     /* 32-bit Ring-0 Interrupt Gate */
+        g_v86_idt[i].ofs_hi    = 0;
+    }
+    g_v86_idtr.limit = sizeof(g_v86_idt) - 1U;
+    g_v86_idtr.base  = cs_phys + (uint32_t)(uint16_t)g_v86_idt;
+
+    *(uint16_t *)(g_v86_payload + 0x01U) = ctx_ofs;
+    *(uint16_t *)(g_v86_gp_isr  + 0x0BU) = ctx_ofs;
+    *(uint16_t *)(g_v86_gp_isr  + 0x83U) = ctx_ofs;
+}
+
+static uint8_t run_v86_roundtrip(uint8_t use_paging, const char **fail_reason)
+{
+    uint16_t far_ptr[2];
+    uint16_t i;
+    uint8_t *cp = (uint8_t *)&g_v86_ctx;
+
+    for (i = 0; i < sizeof(g_v86_ctx); i++) {
+        cp[i] = 0;
+    }
+
+    setup_v86_tables();
+
+    g_v86_ctx.real_cs      = _CS;
+    g_v86_ctx.v86_entry_ip = (uint16_t)g_v86_payload;
+    g_v86_ctx.v86_init_sp  = (uint16_t)(g_v86_u_stk + sizeof(g_v86_u_stk));
+    g_v86_ctx.gdtr_ofs     = (uint16_t)&g_gdtr;
+    g_v86_ctx.idtr_ofs     = (uint16_t)&g_v86_idtr;
+    g_v86_ctx.cr0_or_mask  = use_paging ? 0x80000000UL : 0x00000000UL;
+
+    _SI = (uint16_t)g_bios_gdtr;
+    __emit__(0x66, 0x0F, 0x01, 0x04);       /* SGDT [SI] */
+    _SI = (uint16_t)g_bios_idtr;
+    __emit__(0x66, 0x0F, 0x01, 0x0C);       /* SIDT [SI] */
+
+    _SI = (uint16_t)&g_v86_ctx;
+    _DI = (uint16_t)far_ptr;
+    __emit__(
+        0xFA,                               /* 00: CLI */
+        0x89, 0x24,                         /* 01: MOV [SI], SP */
+        0x89, 0x6C, 0x02,                   /* 03: MOV [SI+2], BP */
+        0xE8, 0x00, 0x00,                   /* 06: CALL $+3 (->09) */
+        0x58,                               /* 09: POP AX */
+        0x05, 0x70, 0x00,                   /* 0A: ADD AX, 70h (->79 rm_resume) */
+        0x89, 0x44, 0x04,                   /* 0D: MOV [SI+4], AX */
+        0x8B, 0x5C, 0x20,                   /* 10: MOV BX, [SI+20h] (&g_gdtr) */
+        0x66, 0x0F, 0x01, 0x17,             /* 13: LGDT [BX] */
+        0x8B, 0x5C, 0x22,                   /* 17: MOV BX, [SI+22h] (&g_v86_idtr) */
+        0x66, 0x0F, 0x01, 0x1F,             /* 1A: LIDT [BX] */
+        0x0F, 0x20, 0xC0,                   /* 1E: MOV EAX, CR0 */
+        0x0C, 0x01,                         /* 21: OR AL, 01h (PE=1) */
+        0x0F, 0x22, 0xC0,                   /* 23: MOV CR0, EAX */
+        0xE8, 0x00, 0x00,                   /* 26: CALL $+3 (->29) */
+        0x58,                               /* 29: POP AX */
+        0x05, 0x0D, 0x00,                   /* 2A: ADD AX, 0Dh (->36 pm_ready) */
+        0x89, 0x05,                         /* 2D: MOV [DI], AX */
+        0xC7, 0x45, 0x02, 0x08, 0x00,       /* 2F: MOV WORD [DI+2], 0008h */
+        0xFF, 0x2D,                         /* 34: JMP FAR [DI] */
+        0x90,                               /* 36: NOP (pm_ready) */
+        0xB8, 0x10, 0x00,                   /* 37: MOV AX, 0010h */
+        0x8E, 0xD8,                         /* 3A: MOV DS, AX */
+        0x8E, 0xC0,                         /* 3C: MOV ES, AX */
+        0x8E, 0xD0,                         /* 3E: MOV SS, AX */
+        0xB8, 0x20, 0x00,                   /* 40: MOV AX, 0020h (32-bit TSS) */
+        0x0F, 0x00, 0xD8,                   /* 43: LTR AX */
+        0x0F, 0x20, 0xC0,                   /* 46: MOV EAX, CR0 */
+        0x66, 0x0B, 0x44, 0x24,             /* 49: OR EAX, [SI+24h] (optional PG=1) */
+        0x0F, 0x22, 0xC0,                   /* 4D: MOV CR0, EAX */
+        0xEB, 0x00,                         /* 50: JMP SHORT $+2 */
+        0x66, 0x0F, 0xB7, 0x44, 0x06,       /* 52: MOVZX EAX, WORD [SI+6] (real_cs) */
+        0x66, 0x50,                         /* 57: PUSH EAX (GS) */
+        0x66, 0x50,                         /* 59: PUSH EAX (FS) */
+        0x66, 0x50,                         /* 5B: PUSH EAX (DS) */
+        0x66, 0x50,                         /* 5D: PUSH EAX (ES) */
+        0x66, 0x50,                         /* 5F: PUSH EAX (SS) */
+        0x66, 0x0F, 0xB7, 0x5C, 0x1E,       /* 61: MOVZX EBX, WORD [SI+1Eh] (ESP) */
+        0x66, 0x53,                         /* 66: PUSH EBX */
+        0x66, 0x68, 0x02, 0x00, 0x02, 0x00, /* 68: PUSH 00020002h (VM=1, IOPL=0, IF=0) */
+        0x66, 0x50,                         /* 6E: PUSH EAX (CS) */
+        0x66, 0x0F, 0xB7, 0x5C, 0x1C,       /* 70: MOVZX EBX, WORD [SI+1Ch] (EIP) */
+        0x66, 0x53,                         /* 75: PUSH EBX */
+        0x66, 0xCF,                         /* 77: IRETD -> ENTER V86! */
+        0x90,                               /* 79: NOP (rm_resume) */
+        0x8C, 0xC8,                         /* 7A: MOV AX, CS */
+        0x8E, 0xD8,                         /* 7C: MOV DS, AX */
+        0x8E, 0xC0,                         /* 7E: MOV ES, AX */
+        0x8E, 0xE0,                         /* 80: MOV FS, AX */
+        0x8E, 0xE8,                         /* 82: MOV GS, AX */
+        0x8E, 0xD0,                         /* 84: MOV SS, AX */
+        0x8B, 0x24,                         /* 86: MOV SP, [SI] */
+        0x8B, 0x6C, 0x02                    /* 88: MOV BP, [SI+2] */
+    );
+
+    _SI = (uint16_t)g_bios_idtr;
+    __emit__(0x66, 0x0F, 0x01, 0x1C);       /* LIDT [SI] */
+    _SI = (uint16_t)g_bios_gdtr;
+    __emit__(0x66, 0x0F, 0x01, 0x14, 0xFB); /* LGDT [SI]; STI */
+
+    if (g_v86_ctx.unexp_vec == 0xFEU) {
+        *fail_reason = "Non-#GP CPU exception trapped inside V86/PM";
+        return 0;
+    }
+    if (g_v86_ctx.unexp_vec != 0) {
+        *fail_reason = "Unexpected opcode trapped in #GP handler";
+        return 0;
+    }
+    if (g_v86_ctx.v86_flag != 0x5638U) {
+        *fail_reason = "V86 unprivileged memory write did not execute";
+        return 0;
+    }
+    if (!g_v86_ctx.cli_trapped) {
+        *fail_reason = "V86 CLI (IOPL=0) did not trap to Ring-0 #GP";
+        return 0;
+    }
+    if ((g_v86_ctx.trap_eflags & 0x00020000UL) == 0) {
+        *fail_reason = "EFLAGS.VM bit not set on #GP frame";
+        return 0;
+    }
+    if (g_v86_ctx.v86_resumed != 0x4F4BU) {
+        *fail_reason = "V86 did not resume after Ring-0 IRETD emulation";
+        return 0;
+    }
+    if (!g_v86_ctx.hlt_trapped || g_v86_ctx.trap_err != 0) {
+        *fail_reason = "V86 HLT exit trap or error code mismatch";
+        return 0;
+    }
+    return 1;
+}
+
+static void test15_v86_mode(void)
+{
+    uint16_t far *bda_mem = (uint16_t far *)MK_FP(0x0040, 0x0013);
+    uint32_t far *pd_ptr  = (uint32_t far *)MK_FP(0x2000, 0x0000);
+    uint32_t far *pt_ptr  = (uint32_t far *)MK_FP(0x2100, 0x0000);
+    uint32_t pd_phys      = 0x00020000UL;
+    uint16_t str_rb       = 0;
+    uint16_t i;
+    const char *reason    = "";
+
+    g_cur_tag   = "[15] Virtual 8086 Mode (V86)";
+    g_test_mark = log_get_pos();
+
+    /* 8086/286 사전 방어 (sub02_smsw 및 32비트 0x66 프리픽스 실행 전 차단) */
+    {
+        uint16_t f1 = swap_flags16(0x0202U);
+        uint16_t f2 = swap_flags16(0x7202U);
+        if ((f1 & 0xF000U) == 0xF000U || (f2 & 0xF000U) == 0x0000U) {
+            log_rewind_to(g_test_mark);
+            out_str("  ");
+            out_str(g_cur_tag);
+            out_str(" : SKIP (CPU < 80386; V86 requires 386+)\n");
+            return;
+        }
+    }
+
+    sub02_smsw();
+    if ((g_msw_val & 0x0001U) != 0) {
+        finish_fail("Blocked by active V86 monitor (MSW.PE=1)", 0xFF);
+        return;
+    }
+
+    /* Substep 1: 32-bit TSS(0x20) LTR 적재 및 STR/Busy 비트 검증 */
+    prep_substep(1, "Load 32-bit TSS (LTR 0x20) and verify STR/Busy bit");
+    setup_v86_tables();
+    _SI = (uint16_t)g_bios_gdtr;
+    __emit__(0x66, 0x0F, 0x01, 0x04);
+    _SI = (uint16_t)&g_gdtr;
+    _DI = (uint16_t)&str_rb;
+    __emit__(
+        0xFA,
+        0x66, 0x0F, 0x01, 0x14,             /* LGDT [SI] */
+        0x0F, 0x20, 0xC0,
+        0x0C, 0x01,
+        0x0F, 0x22, 0xC0,                   /* PE=1 */
+        0xEB, 0x00,
+        0xB8, 0x20, 0x00,                   /* MOV AX, 0020h */
+        0x0F, 0x00, 0xD8,                   /* LTR AX */
+        0x0F, 0x00, 0xC8,                   /* STR AX */
+        0x89, 0x05,                         /* MOV [DI], AX */
+        0x0F, 0x20, 0xC0,
+        0x24, 0xFE,
+        0x0F, 0x22, 0xC0,                   /* PE=0 */
+        0xEB, 0x00
+    );
+    _SI = (uint16_t)g_bios_gdtr;
+    __emit__(0x66, 0x0F, 0x01, 0x14, 0xFB);
+
+    if (str_rb != 0x0020U || (g_gdt[4].access & 0x02U) == 0) {
+        finish_fail("LTR/STR 32-bit TSS load or Busy bit check failed", 0xFF);
+        return;
+    }
+
+    /* Substep 2: Non-Paged V86 진입 -> CLI #GP 에뮬레이션/IRETD 복귀 -> HLT 탈출 */
+    prep_substep(2, "V86 (PG=0): IRETD -> write -> CLI #GP emulate -> IRETD -> HLT");
+    if (!run_v86_roundtrip(0, &reason)) {
+        finish_fail(reason, 0xFF);
+        return;
+    }
+
+    /* Substep 3: Paged V86 (CR0.PG=1 + U/S=1 User 페이지 테이블, EMM386/VMM 동일 환경) */
+    if (*bda_mem < 192U) {
+        finish_pass("TSS + V86(PG=0) CLI #GP emulate/IRETD/HLT OK (PG=1 skipped: <192KB)");
+        return;
+    }
+
+    prep_substep(3, "V86 (PG=1, U/S=1): Paged V86 + CLI #GP emulate/IRETD + HLT");
+    for (i = 0; i < 1024U; i++) {
+        pd_ptr[i] = 0x00000002UL;                           /* Not Present */
+        pt_ptr[i] = ((uint32_t)i << 12) | 0x00000007UL;     /* 0~4MB 1:1 Present+R/W+User */
+    }
+    pd_ptr[0] = 0x00021007UL;                               /* PDE[0] Present+R/W+User */
+
+    _SI = (uint16_t)&pd_phys;
+    __emit__(
+        0x66, 0x8B, 0x04,                                   /* MOV EAX, [SI] */
+        0x0F, 0x22, 0xD8                                    /* MOV CR3, EAX  */
+    );
+
+    if (!run_v86_roundtrip(1, &reason)) {
+        finish_fail(reason, 0xFF);
+        return;
+    }
+
+    /* Substep 4: V86 복귀 후 BIOS GDTR/IDTR 원상 복구 역읽기 검증 */
+    prep_substep(4, "Verify BIOS GDTR/IDTR restored after V86 exit");
+    {
+        uint8_t cur_gdtr[6], cur_idtr[6];
+        uint8_t k, mismatch = 0;
+
+        _SI = (uint16_t)cur_gdtr;
+        __emit__(0x66, 0x0F, 0x01, 0x04);       /* SGDT [SI] */
+        _SI = (uint16_t)cur_idtr;
+        __emit__(0x66, 0x0F, 0x01, 0x0C);       /* SIDT [SI] */
+
+        for (k = 0; k < 6U; k++) {
+            if (cur_gdtr[k] != g_bios_gdtr[k] || cur_idtr[k] != g_bios_idtr[k]) {
+                mismatch = 1;
+                break;
+            }
+        }
+        if (mismatch) {
+            finish_fail("BIOS GDTR/IDTR readback mismatch after V86 exit", 0xFF);
+            return;
+        }
+    }
+
+    finish_pass("32-bit TSS + V86(PG=0 & PG=1/User) CLI #GP emulate -> IRETD -> HLT OK");
+}
+
+/* ---------------------------------------------------------
  * 인터랙티브 메뉴 출력 및 사용자 번호 선택 실행기
  * --------------------------------------------------------- */
 static void print_cpu_menu(void)
 {
     put_str("\n--- Select CPU Instruction / Mode Micro-Test ---\n");
-    put_str("  [1]  FLAGS/EFLAGS Arch (8086/286/386/486/ID)   [8]  MMX 64-bit SIMD (MOVQ/PADDB/EMMS)\n");
-    put_str("  [2]  286 Protected Status (SMSW/SGDT/SIDT)     [9]  SSE 128-bit & CR4.OSFXSR\n");
-    put_str("  [3]  386 Control/Debug Regs (CR0/CR2/CR3/DR7)  [10] LGDT/SGDT Table Dry-Run\n");
-    put_str("  [4]  x87 FPU Coprocessor (FNINIT/FADDP)        [11] 16-bit Protected Mode (4 Substeps)\n");
-    put_str("  [5]  CPUID Leaves & Feature Flags              [12] Unreal Mode 4GB Limit (3 Substeps)\n");
-    put_str("  [6]  RDTSC & CR4 Monotonic Check               [13] 32-bit Protected Mode (2 Substeps)\n");
-    put_str("  [7]  CMPXCHG8B & RDMSR(0x10)                   [14] 32-bit Paging CR3/PG=1 (4 Substeps)\n");
-    put_str("  [A]  Run ALL sequentially (1..14)              [L]  Show list   [0/Q] Exit CPU Test\n");
+    put_str("  [1]  FLAGS/EFLAGS Arch (8086/286/386/486/ID)   [9]  SSE 128-bit & CR4.OSFXSR\n");
+    put_str("  [2]  286 Protected Status (SMSW/SGDT/SIDT)     [10] LGDT/SGDT Table Dry-Run\n");
+    put_str("  [3]  386 Control/Debug Regs (CR0/CR2/CR3/DR7)  [11] 16-bit Protected Mode (3 Substeps)\n");
+    put_str("  [4]  x87 FPU Coprocessor (FNINIT/FADDP)        [12] Unreal Mode 4GB Limit (3 Substeps)\n");
+    put_str("  [5]  CPUID Leaves & Feature Flags              [13] 32-bit Protected Mode (2 Substeps)\n");
+    put_str("  [6]  RDTSC & CR4 Monotonic Check               [14] 32-bit Paging CR3/PG=1 (4 Substeps)\n");
+    put_str("  [7]  CMPXCHG8B & RDMSR(0x10)                   [15] Virtual 8086 Mode (TSS/IDT/#GP/PG)\n");
+    put_str("  [8]  MMX 64-bit SIMD (MOVQ/PADDB/EMMS)\n");
+    put_str("  [A]  Run ALL sequentially (1..15)              [L]  Show list   [0/Q] Exit CPU Test\n");
 }
 
 static void dispatch_cpu_test(uint8_t num)
@@ -1272,6 +1649,7 @@ static void dispatch_cpu_test(uint8_t num)
     else if (num == 12) test12_unreal_mode();
     else if (num == 13) test13_pm32_flat();
     else if (num == 14) test14_pm_paging();
+    else if (num == 15) test15_v86_mode();
 }
 
 void run_cpu_test(void)
@@ -1282,13 +1660,14 @@ void run_cpu_test(void)
     out_str("Pre-writes FAIL to RESULT.TXT before each micro-step; overwrites with PASS on survival.\n");
 
     print_cpu_menu();
+    cpu_kbd_drain();
 
     while (1) {
         char    buf[8];
         uint8_t len = 0;
         uint8_t num = 0;
 
-        put_str("\nSelect test [1-14, A=All, L=List, 0/Q=Exit] > ");
+        put_str("\nSelect test [1-15, A=All, L=List, 0/Q=Exit] > ");
 
         while (1) {
             uint8_t ch;
@@ -1303,6 +1682,9 @@ void run_cpu_test(void)
             if (ch == 0x08) {
                 if (len > 0) {
                     len--;
+                    put_ch('\b');
+                    put_ch(' ');
+                    put_ch('\b');
                 }
                 continue;
             }
@@ -1325,7 +1707,7 @@ void run_cpu_test(void)
             continue;
         }
         if (buf[0] == 'a' || buf[0] == 'A') {
-            for (i = 1; i <= 14; i++) {
+            for (i = 1; i <= 15; i++) {
                 dispatch_cpu_test(i);
             }
             continue;
@@ -1340,10 +1722,10 @@ void run_cpu_test(void)
             }
         }
 
-        if (num >= 1 && num <= 14) {
+        if (num >= 1 && num <= 15) {
             dispatch_cpu_test(num);
         } else {
-            put_str("  Invalid selection. Enter 1..14, A, L, or Q.\n");
+            put_str("  Invalid selection. Enter 1..15, A, L, or Q.\n");
         }
     }
 }

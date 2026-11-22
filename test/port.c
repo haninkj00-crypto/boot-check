@@ -81,21 +81,26 @@ static void uart_send_str(uint16_t base, const char *s)
     }
 }
 
+static volatile uint32_t far *port_ticks =
+    (volatile uint32_t far *)MK_FP(0x0040, 0x006C);
+
 static uint8_t uart_recv_buf(uint16_t base, uint8_t *buf, uint8_t max_len,
                              uint16_t wait_ms, uint8_t *lsr_err_out)
 {
     uint8_t  cnt = 0;
-    uint16_t elapsed = 0;
     uint8_t  err_acc = 0;
+    uint32_t t0 = *port_ticks;
+    uint32_t wait_ticks = ((uint32_t)wait_ms + 54UL) / 55UL;
 
-    while (elapsed < wait_ms && cnt < max_len) {
+    if (wait_ticks < 2UL) {
+        wait_ticks = 2UL;
+    }
+
+    while ((*port_ticks - t0) < wait_ticks && cnt < max_len) {
         uint8_t lsr = inb(base + 5U);
         err_acc |= (uint8_t)(lsr & 0x1EU);  /* OE(02), PE(04), FE(08), BI(10) */
         if ((lsr & 0x01U) != 0) {
             buf[cnt++] = inb(base + 0U);
-        } else {
-            delay_ms_pit(5);
-            elapsed += 5U;
         }
     }
     if (lsr_err_out) {
@@ -163,6 +168,7 @@ void test_com_port(uint16_t base, const char *origin)
     const uint16_t divisors[3] = { 12U, 48U, 3U };      /* 9600, 2400, 38400 bps */
     const char    *baud_str[3] = { "9600", "2400", "38400" };
     uint8_t modem_found = 0, got_any_data = 0, last_err = 0;
+    uint8_t has_fifo = 0;
     uint8_t last_rx[24];
     uint8_t last_rx_len = 0;
 
@@ -210,10 +216,17 @@ void test_com_port(uint16_t base, const char *origin)
     } else {
         outb(base + 2U, 0x01);          /* FIFO Enable */
         iir = (uint8_t)(inb(base + 2U) & 0xC0U);
-        outb(base + 2U, 0x00);          /* FIFO Off */
-        if (iir == 0xC0U)      out_str("UART 16550A");
-        else if (iir == 0x80U) out_str("UART 16550");
-        else                   out_str("UART 16450");
+        if (iir == 0xC0U) {
+            out_str("UART 16550A");
+            has_fifo = 1;
+            outb(base + 2U, 0xC7);      /* 16B FIFO 활성 + RX/TX 클리어 */
+        } else if (iir == 0x80U) {
+            outb(base + 2U, 0x00);
+            out_str("UART 16550");
+        } else {
+            outb(base + 2U, 0x00);
+            out_str("UART 16450");
+        }
     }
 
     /* 모뎀 제어선 상태(MSR) 표시 */
@@ -332,6 +345,9 @@ void test_com_port(uint16_t base, const char *origin)
     }
 
 restore_uart:
+    if (has_fifo) {
+        outb(base + 2U, 0x06);          /* FIFO 비우기 + 비활성 복원 */
+    }
     outb(base + 3U, (uint8_t)(orig_lcr | 0x80U));
     outb(base + 0U, dll);
     outb(base + 1U, dlh);
